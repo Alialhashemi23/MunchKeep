@@ -1,0 +1,28 @@
+{
+  "_readme": [
+    "Sprite manifest: maps logical ids to texture files under Content/Assets.",
+    "Entries without a 'texture' field (or whose file is missing) fall back to",
+    "generated placeholder shapes, so the game always runs. To re-skin the game,",
+    "drop PNGs here and add texture/x/y/w/h/originX/originY to the entries below —",
+    "no code changes or content rebuild needed.",
+    "Tiles pivot at the diamond center by default; units pivot at bottom-center (feet)."
+  ],
+  "tileWidth": 64,
+  "tileHeight": 32,
+  "sprites": [
+    { "id": "tile.rock" },
+    { "id": "tile.corridor" },
+    { "id": "tile.mobroom" },
+    { "id": "tile.traproom" },
+    { "id": "tile.entrance" },
+    { "id": "tile.heart" },
+    { "id": "tile.highlight.valid" },
+    { "id": "tile.highlight.invalid" },
+    { "id": "tile.highlight.select" },
+    { "id": "unit.hero" },
+    { "id": "unit.goblin" },
+    { "id": "unit.corpse" },
+    { "id": "fx.heart" },
+    { "id": "fx.spikes" }
+  ]
+}
