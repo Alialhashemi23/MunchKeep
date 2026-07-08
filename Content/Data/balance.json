@@ -1,0 +1,56 @@
+{
+  "GridWidth": 24,
+  "GridHeight": 24,
+  "EntranceX": 2,
+  "EntranceY": 11,
+  "HeartX": 12,
+  "HeartY": 11,
+
+  "StartEssence": 60,
+  "StartScrap": 0,
+  "CorridorCost": 5,
+  "MobRoomCost": 25,
+  "TrapRoomCost": 20,
+  "DemolishRefund": 0.5,
+
+  "HeroBaseHp": 30,
+  "HeroHpPerLevel": 12,
+  "HeroBaseDamage": 4,
+  "HeroDamagePerLevel": 1.5,
+  "HeroAttackCooldown": 1.0,
+  "HeroSpeed": 1.8,
+  "HeroLootEssencePerLevel": 10,
+  "HeroLootScrapPerLevel": 3,
+
+  "MobBaseHp": 20,
+  "MobHpPerLevel": 8,
+  "MobBaseDamage": 3,
+  "MobDamagePerLevel": 1.2,
+  "MobAttackCooldown": 0.8,
+  "MobRespawnSeconds": 15,
+  "MobUpgradeBaseCost": 5,
+  "MobUpgradeCostGrowth": 1.6,
+
+  "TrapDamage": 8,
+  "TrapRearmSeconds": 3,
+
+  "PartyIntervalSeconds": 45,
+  "SpawnStaggerSeconds": 0.6,
+  "RenownPerHeroLevel": 15,
+  "RenownPerPartySize": 20,
+  "MaxPartySize": 3,
+  "RenownPerKillPerLevel": 1,
+  "PartyWipeRenown": 3,
+
+  "HeartMaxHp": 100,
+  "HeartRegenPerSecond": 0.5,
+  "HeartStealFractionPerHit": 0.02,
+  "HeartHitsPerHero": 5,
+  "HeartBreakResourceLoss": 0.25,
+  "HeartBreakRenownLoss": 0.1,
+
+  "CorpseDissolveSeconds": 4,
+
+  "OfflineCapHours": 8,
+  "OfflineEfficiency": 0.5
+}
