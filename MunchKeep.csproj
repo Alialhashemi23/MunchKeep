@@ -13,6 +13,12 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Icon.ico</ApplicationIcon>
   </PropertyGroup>
+  <!-- The game csproj lives at the repo root, so keep the test project out of its globs. -->
+  <ItemGroup>
+    <Compile Remove="MunchKeep.Tests/**" />
+    <Content Remove="MunchKeep.Tests/**" />
+    <None Remove="MunchKeep.Tests/**" />
+  </ItemGroup>
   <ItemGroup>
     <None Remove="Icon.ico" />
     <None Remove="Icon.bmp" />
