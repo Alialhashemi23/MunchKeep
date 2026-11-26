@@ -35,7 +35,7 @@ function start(data: unknown): void {
   const keeper = new Keeper(audio, storage(), typeof saved === 'string' ? saved : undefined);
   const bank = buildBank();
 
-  new Phaser.Game({
+  const game = new Phaser.Game({
     type: Phaser.AUTO,
     parent: 'game',
     backgroundColor: '#120d16',
@@ -56,7 +56,7 @@ function start(data: unknown): void {
   } catch {
     // Not running inside the artifact viewer.
   }
-  if (import.meta.env.DEV) Object.assign(window, { munchkeep: keeper, MunchBot: Bot });
+  if (import.meta.env.DEV) Object.assign(window, { munchkeep: keeper, MunchBot: Bot, munchgame: game });
 }
 
 if (hot?.ready) hot.ready(start);

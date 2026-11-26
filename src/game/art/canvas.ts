@@ -113,23 +113,55 @@ export function noise(x: number, y: number, seed: number): number {
   return (h >>> 0) / 4294967296;
 }
 
-export const TILE_W = 32;
-export const TILE_H = 16;
-export const BLOCK_H = 9;
-
-/** Half-width of the 2:1 iso diamond on row y (0..TILE_H-1). */
-export function diamondHalf(y: number): number {
-  return y < TILE_H / 2 ? (y + 1) * 2 : (TILE_H - y) * 2;
+/** Anything that can take a pixel: a canvas painter or a raw buffer. */
+export interface Painter {
+  set(x: number, y: number, color: string, alpha?: number): void;
 }
 
-export function inDiamond(x: number, y: number): boolean {
-  if (y < 0 || y >= TILE_H) return false;
-  const hw = diamondHalf(y);
-  return x >= TILE_W / 2 - hw && x < TILE_W / 2 + hw;
+const colorCache = new Map<string, [number, number, number]>();
+function rgb(c: string): [number, number, number] {
+  let v = colorCache.get(c);
+  if (!v) {
+    v = hex(c);
+    colorCache.set(c, v);
+  }
+  return v;
 }
 
-/** True for diamond pixels that sit on its border. */
-export function onDiamondEdge(x: number, y: number): boolean {
-  if (!inDiamond(x, y)) return false;
-  return !inDiamond(x - 1, y) || !inDiamond(x + 1, y) || !inDiamond(x, y - 1) || !inDiamond(x, y + 1);
+/** A raw RGBA buffer: much faster than canvas calls when painting thousands of tiles. */
+export class PixBuf implements Painter {
+  readonly data: Uint8ClampedArray<ArrayBuffer>;
+  constructor(
+    readonly w: number,
+    readonly h: number,
+  ) {
+    this.data = new Uint8ClampedArray(new ArrayBuffer(w * h * 4));
+  }
+
+  set(x: number, y: number, color: string, alpha = 1): void {
+    x = Math.floor(x);
+    y = Math.floor(y);
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h) return;
+    const [r, g, b] = rgb(color);
+    const i = (y * this.w + x) * 4;
+    const d = this.data;
+    if (alpha >= 1) {
+      d[i] = r;
+      d[i + 1] = g;
+      d[i + 2] = b;
+      d[i + 3] = 255;
+      return;
+    }
+    const a0 = d[i + 3] / 255;
+    const a = alpha + a0 * (1 - alpha);
+    if (a <= 0) return;
+    d[i] = (r * alpha + d[i] * a0 * (1 - alpha)) / a;
+    d[i + 1] = (g * alpha + d[i + 1] * a0 * (1 - alpha)) / a;
+    d[i + 2] = (b * alpha + d[i + 2] * a0 * (1 - alpha)) / a;
+    d[i + 3] = a * 255;
+  }
+
+  toImageData(): ImageData {
+    return new ImageData(this.data, this.w, this.h);
+  }
 }

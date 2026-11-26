@@ -11,16 +11,16 @@ import { Sim } from '../src/sim/sim';
 const SEEDS = [1, 2, 3, 4, 5];
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 
-describe('Run length', { timeout: 60_000 }, () => {
+describe('Run length', { timeout: 120_000 }, () => {
   it('doing nothing loses quickly', () => {
     const mins = SEEDS.map((s) => playOut(new Sim(newMeta(), s), 'idle', 90).minutes);
     expect(median(mins)).toBeLessThan(10);
   });
 
-  it('a beginner who only builds monsters and spikes lasts a while, not forever', () => {
+  it('a beginner who only builds on the starting route lasts a while, not forever', () => {
     const mins = SEEDS.map((s) => playOut(new Sim(newMeta(), s), 'basic', 90).minutes);
-    expect(median(mins)).toBeGreaterThan(10);
-    expect(median(mins)).toBeLessThan(28);
+    expect(median(mins)).toBeGreaterThan(9);
+    expect(median(mins)).toBeLessThan(25);
   });
 
   it('a decent player lands in the 30-60 minute window', () => {

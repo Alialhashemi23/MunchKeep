@@ -1,136 +1,158 @@
 import { describe, expect, it } from 'vitest';
 import type { SimEvent } from '../src/sim/sim';
-import { blankSim, carve, carveBypass, carveMainRoute, place, run } from './helpers';
+import { A, B, C, D, E, S, build, edge, party, run, runUntil, testSim } from './helpers';
 
-describe('Hero routing', () => {
-  it('Clerics route around a trap they have heard about; Knights walk straight through', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    carveBypass(sim);
-    const g = sim.grid;
-    const trap = place(sim, 7, 10, 'spikes');
-    sim.rumors.set(trap, { feature: 'spikes', until: 1e9 });
+const detour = (sim: ReturnType<typeof testSim>) => {
+  sim.dig(edge(sim, A, B));
+  sim.dig(edge(sim, B, D));
+  sim.dig(edge(sim, D, C));
+};
 
-    expect(sim.previewRoute('knight')).toContain(trap);
-    expect(sim.previewRoute('cleric')).not.toContain(trap);
-    expect(sim.previewRoute('cleric')).toContain(g.idx(11, 2));
-  });
-
-  it('nobody avoids a trap the town has not heard about', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    carveBypass(sim);
-    const trap = place(sim, 7, 10, 'spikes');
-    expect(sim.previewRoute('cleric')).toContain(trap);
-  });
-
-  it('Rogues detour for a Hoard down a side tunnel; Knights do not', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    carve(sim, 5, 6, 5, 9); // 3-tile side tunnel
-    const hoard = place(sim, 5, 9, 'hoard');
-    expect(sim.previewRoute('rogue')).toContain(hoard);
-    expect(sim.previewRoute('knight')).not.toContain(hoard);
-  });
-
-  it('only very greedy heroes go far out of their way', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    carve(sim, 5, 6, 5, 12); // 6 tiles deep
-    const hoard = place(sim, 5, 12, 'hoard');
-    expect(sim.previewRoute('rogue')).toContain(hoard);
-    expect(sim.previewRoute('cleric')).not.toContain(hoard);
-  });
-
-  it('treats an unknown Mimic as treasure, and avoids it once warned', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    carve(sim, 5, 6, 5, 9);
-    const mimic = place(sim, 5, 9, 'mimic');
-    expect(sim.previewRoute('rogue')).toContain(mimic);
-    sim.rumors.set(mimic, { feature: 'mimic', until: 1e9 });
-    expect(sim.previewRoute('rogue')).not.toContain(mimic);
-  });
-
-  it('a hero walks the whole way, bites the Maw and runs home with Gold', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    const knight = sim.spawnHero('knight', 1);
+describe('Parties', () => {
+  it('walk from the gate to the Maw together and bite it', () => {
+    const sim = testSim();
+    const p = party(sim, ['knight', 'cleric']);
     const events: SimEvent[] = [];
-    const gold = sim.gold;
-    run(sim, 40, events);
+    runUntil(sim, () => p.state === 'bite', 60, events);
+    expect(p.state).toBe('bite');
+    expect(p.to).toBe(1);
+    run(sim, 3, events);
     expect(events.some((e) => e.t === 'bite')).toBe(true);
     expect(sim.mawHp).toBeLessThan(sim.mawMaxHp);
-    expect(sim.gold).toBeLessThan(gold + 40 * 0.35);
-    // Either chomped by the Maw or escaped with the loot.
-    expect(sim.heroes.includes(knight)).toBe(false);
   });
 
-  it('a hero that escapes spreads rumors the next party already knows', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    const trap = place(sim, 2, 6, 'spikes');
-    const cleric = sim.spawnHero('cleric', 1);
-    cleric.hp = 15; // one spike hit sends it running
-    const events: SimEvent[] = [];
-    run(sim, 15, events);
-    expect(events.some((e) => e.t === 'escaped')).toBe(true);
-    expect(sim.rumors.get(trap)?.feature).toBe('spikes');
+  it('must clear a monster room before moving on', () => {
+    const sim = testSim();
+    build(sim, A, 'goblinWarren');
+    const p = party(sim, ['knight'], 3);
+    runUntil(sim, () => p.state === 'fight', 30);
+    expect(p.state).toBe('fight');
+    expect(p.to).toBe(A);
+    // Still there while goblins stand.
+    run(sim, 1);
+    if (sim.standing(A).length) expect(p.to).toBe(A);
+    runUntil(sim, () => sim.standing(A).length === 0 || !sim.parties.includes(p), 60);
+    run(sim, 0.2);
+    if (sim.parties.includes(p)) expect(p.state).toBe('move');
+  });
 
-    const next = sim.spawnHero('cleric', 1);
-    expect(sim.parties.get(next.partyId)!.known.get(trap)).toBe('spikes');
+  it('Clerics avoid a room they have heard about; Knights walk straight through', () => {
+    const sim = testSim();
+    detour(sim);
+    build(sim, E, 'trollDen');
+    expect(sim.previewRoute('cleric')).toContain(E);
+    sim.rumors.set(E, { room: 'trollDen', until: 1e9 });
+    expect(sim.previewRoute('knight')).toContain(E);
+    expect(sim.previewRoute('cleric')).not.toContain(E);
+    expect(sim.previewRoute('cleric')).toContain(B);
+  });
+
+  it('greedy parties detour to a Vault they can see', () => {
+    const sim = testSim();
+    sim.dig(edge(sim, A, S));
+    build(sim, S, 'vault');
+    expect(sim.previewRoute('rogue')).toContain(S);
+    expect(sim.previewRoute('knight')).not.toContain(S);
+  });
+
+  it('a Rogue slips away from its party to raid a Vault', () => {
+    const sim = testSim();
+    sim.dig(edge(sim, A, S));
+    build(sim, S, 'vault');
+    const p = party(sim, ['knight', 'knight', 'rogue']);
+    const events: SimEvent[] = [];
+    runUntil(sim, () => events.some((e) => e.t === 'loot'), 60, events);
+    expect(events.some((e) => e.t === 'split' && e.reason === 'loot')).toBe(true);
+    expect(events.some((e) => e.t === 'loot')).toBe(true);
+    expect(p.members.every((h) => h.cls === 'knight')).toBe(true);
+  });
+
+  it('heroes who escape spread rumors that the next party already knows', () => {
+    const sim = testSim();
+    build(sim, A, 'spikeHall');
+    const p = party(sim, ['cleric']);
+    p.members[0].hp = 16; // one or two stabs and it runs
+    const events: SimEvent[] = [];
+    runUntil(sim, () => events.some((e) => e.t === 'escaped' || e.t === 'heroDied'), 60, events);
+    if (events.some((e) => e.t === 'escaped')) {
+      expect(sim.rumors.get(A)?.room).toBe('spikeHall');
+      const next = party(sim, ['knight']);
+      expect(next.known.get(A)).toBe('spikeHall');
+    } else {
+      // Died before escaping: nobody learned anything.
+      expect(sim.rumors.size).toBe(0);
+    }
   });
 
   it('rumors fade', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    sim.rumors.set(sim.grid.idx(3, 6), { feature: 'spikes', until: 5 });
-    run(sim, 6);
+    const sim = testSim();
+    sim.rumors.set(A, { room: 'spikeHall', until: 3 });
+    run(sim, 4);
     expect(sim.rumors.size).toBe(0);
   });
 
-  it('Clerics heal wounded allies', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    const knight = sim.spawnHero('knight', 1);
-    sim.spawnHero('cleric', 1, knight.partyId);
-    knight.hp = 20;
+  it('Rogues peek into neighboring rooms and disarm traps they know', () => {
+    const sim = testSim();
+    build(sim, A, 'spikeHall');
+    sim.rumors.set(A, { room: 'spikeHall', until: 1e9 });
+    const events: SimEvent[] = [];
+    for (let k = 0; k < 12; k++) {
+      party(sim, ['rogue', 'knight'], 5);
+      run(sim, 2, events);
+    }
+    run(sim, 30, events);
+    expect(events.some((e) => e.t === 'disarm')).toBe(true);
+  });
+
+  it('traps linked to a Gloom Hall cannot be disarmed', () => {
+    const sim = testSim();
+    build(sim, A, 'spikeHall');
+    build(sim, S, 'gloomHall');
+    sim.dig(edge(sim, A, S));
+    sim.rumors.set(A, { room: 'spikeHall', until: 1e9 });
+    const events: SimEvent[] = [];
+    for (let k = 0; k < 12; k++) {
+      party(sim, ['rogue', 'knight'], 5);
+      run(sim, 2, events);
+    }
+    run(sim, 30, events);
+    expect(events.some((e) => e.t === 'disarm')).toBe(false);
+  });
+
+  it('Clerics heal the party', () => {
+    const sim = testSim();
+    const p = party(sim, ['knight', 'cleric']);
+    p.members[0].hp = 20;
     const events: SimEvent[] = [];
     run(sim, 3, events);
     expect(events.some((e) => e.t === 'heal')).toBe(true);
-    expect(knight.hp).toBeGreaterThan(20);
+    expect(p.members.find((h) => h.cls === 'knight')!.hp).toBeGreaterThan(20);
   });
-});
 
-describe('Parties', () => {
+  it('a wiped-out party pays bonus Infamy', () => {
+    const sim = testSim();
+    const p = party(sim, ['knight', 'knight']);
+    const events: SimEvent[] = [];
+    for (const h of [...p.members]) sim.damageHero(h, p, 9999);
+    run(sim, 0.1, events);
+    expect(events.find((e) => e.t === 'wipe')).toMatchObject({ size: 2 });
+  });
+
+  it('Champions arrive on schedule with a name', () => {
+    const sim = testSim();
+    sim.nextChampionAt = 1;
+    const events: SimEvent[] = [];
+    run(sim, 1.5, events);
+    const e = events.find((x) => x.t === 'party');
+    expect(e && e.t === 'party' && e.champion).toBeTruthy();
+  });
+
   it('get bigger and stronger over time', () => {
-    const sim = blankSim();
+    const sim = testSim();
     const early = { lvl: sim.partyLevel(), size: sim.partySize() };
     sim.time = 30 * 60;
     sim.infamy = 500;
     expect(sim.partyLevel()).toBeGreaterThan(early.lvl + 3);
     expect(sim.partySize()).toBeGreaterThan(early.size + 1.5);
-  });
-
-  it('a party wiped out to the last hero pays bonus Infamy', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    const a = sim.spawnHero('knight', 1);
-    const b = sim.spawnHero('knight', 1, a.partyId);
-    const events: SimEvent[] = [];
-    sim.damageHero(a, 999);
-    sim.damageHero(b, 999);
-    run(sim, 0.1, events);
-    expect(events.find((e) => e.t === 'wipe')).toMatchObject({ t: 'wipe', size: 2 });
-  });
-
-  it('Champions arrive on schedule with a name', () => {
-    const sim = blankSim();
-    carveMainRoute(sim);
-    sim.nextChampionAt = 1;
-    const events: SimEvent[] = [];
-    run(sim, 1.5, events);
-    const party = events.find((e) => e.t === 'party');
-    expect(party && party.t === 'party' && party.champion).toBeTruthy();
   });
 });

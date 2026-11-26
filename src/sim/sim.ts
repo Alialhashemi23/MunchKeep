@@ -1,251 +1,315 @@
+import { generateCave, otherEnd, type Cave, type Edge, type Site } from './cave';
 import {
   BALANCE,
   CHAMPION_NAMES,
-  FEATURES,
-  FEATURE_ORDER,
   HEROES,
   MONSTERS,
+  ROOMS,
+  ROOM_ORDER,
   heroDmgMul,
   heroHpMul,
   heroRewardMul,
-  monsterDmgMul,
-  monsterHpMul,
-  trapDmgMul,
-  type FeatureId,
+  trackCost,
+  type Cost,
   type HeroClass,
   type MonsterKind,
+  type RoomId,
 } from './content';
-import { Grid, type Feature } from './grid';
 import { metaMods, type MetaMods, type MetaState } from './meta';
-import { dijkstra, pathTo, type DistanceField } from './pathfinding';
 import { Rng } from './rng';
 
-// ---------------------------------------------------------------- entity types
-
-export type HeroGoal = 'loot' | 'maw' | 'flee';
-export type HeroState = 'walk' | 'fight' | 'loot' | 'bite' | 'dead' | 'escaped';
+// ---------------------------------------------------------------- entities
 
 export interface Hero {
   id: number;
   cls: HeroClass;
   level: number;
-  partyId: number;
   champion: string | null;
+  group: number;
   hp: number;
   maxHp: number;
   dmg: number;
   cooldown: number;
   speed: number;
   armor: number;
-  x: number;
-  y: number;
-  px: number;
-  py: number;
-  /** Last tile center the hero reached. */
-  tile: number;
-  path: number[];
-  pathIdx: number;
-  target: number;
-  goal: HeroGoal;
-  state: HeroState;
-  planVersion: string;
   atk: number;
-  lootT: number;
   healT: number;
   loot: number;
-  looted: number[];
   lootsLeft: number;
   bites: number;
   sticky: number;
   oily: number;
   burning: number;
   burnDps: number;
-  burnAcc: number;
-  spotRolled: number[];
-  disarmTried: number[];
-  facing: 1 | -1;
+  bleed: number;
+  bleedDps: number;
+  poison: number;
+  poisonDps: number;
+  cursed: number;
+  cursedDps: number;
+  dotAcc: number;
+  dead: boolean;
   lastHitAt: number;
   lastAttackAt: number;
+}
+
+export type PartyGoal = 'maw' | 'loot' | 'flee';
+export type PartyState = 'move' | 'fight' | 'loot' | 'bite';
+
+export interface Party {
+  id: number;
+  members: Hero[];
+  known: Map<number, RoomId>;
+  disarmed: Set<number>;
+  looted: Set<number>;
+  goal: PartyGoal;
+  target: number;
+  route: number[];
+  from: number;
+  to: number;
+  d: number;
+  len: number;
+  x: number;
+  y: number;
+  px: number;
+  py: number;
+  state: PartyState;
+  lootT: number;
+  /** Site whose room rectangle the party is standing in, or -1. */
+  inside: number;
 }
 
 export interface Monster {
   id: number;
   kind: MonsterKind;
-  lair: number;
+  site: number;
   slot: number;
-  level: number;
   hp: number;
   maxHp: number;
-  dmg: number;
-  cooldown: number;
-  speed: number;
-  x: number;
-  y: number;
-  px: number;
-  py: number;
-  homeX: number;
-  homeY: number;
   atk: number;
-  targetId: number | null;
+  /** Skeletons: seconds until they get back up (0 when standing). */
+  down: number;
+  reassembled: boolean;
   ambush: boolean;
-  idleT: number;
-  facing: 1 | -1;
+  targetId: number | null;
   lastHitAt: number;
   lastAttackAt: number;
 }
 
-export interface Party {
-  id: number;
-  known: Map<number, FeatureId>;
-  version: number;
+export interface Room {
+  site: number;
+  id: RoomId;
+  ranks: [number, number, number];
+  invested: Cost;
+  slots: { monsterId: number | null; respawn: number }[];
+  trapT: number;
+}
+
+export interface Rumor {
+  room: RoomId;
+  until: number;
+}
+
+export type SimEvent =
+  | { t: 'damage'; x: number; y: number; amount: number; on: 'hero' | 'monster'; id: number; site: number; crit?: boolean; dot?: boolean }
+  | { t: 'heroDied'; id: number; x: number; y: number; site: number; gold: number; essence: number; infamy: number; cls: HeroClass; champion: string | null; bonus: boolean }
+  | { t: 'monsterDied'; id: number; site: number; kind: MonsterKind }
+  | { t: 'monsterDown'; id: number; site: number }
+  | { t: 'monsterUp'; id: number; site: number }
+  | { t: 'trap'; site: number; room: RoomId; heroId?: number; crit?: boolean }
+  | { t: 'ignite'; heroId: number }
+  | { t: 'status'; heroId: number; status: 'sticky' | 'oily' | 'cursed' | 'poison' }
+  | { t: 'disarm'; site: number }
+  | { t: 'spotted'; site: number }
+  | { t: 'loot'; site: number; heroId: number; amount: number }
+  | { t: 'bite'; heroId: number; amount: number; stolen: number }
+  | { t: 'chomp'; heroId: number }
+  | { t: 'escaped'; cls: HeroClass; loot: number; rumors: number }
+  | { t: 'party'; size: number; level: number; champion: string | null }
+  | { t: 'heal'; heroId: number; amount: number }
+  | { t: 'unlock'; tier: number }
+  | { t: 'respawn'; site: number; kind: MonsterKind }
+  | { t: 'wipe'; size: number; infamy: number }
+  | { t: 'ambush'; site: number }
+  | { t: 'fall'; heroId: number; site: number; eaten: boolean }
+  | { t: 'split'; heroId: number; reason: 'loot' | 'flee' }
+  | { t: 'excavated'; region: number }
+  | { t: 'collapse' };
+
+export type ActionResult = { ok: true } | { ok: false; reason: string };
+const OK: ActionResult = { ok: true };
+const fail = (reason: string): ActionResult => ({ ok: false, reason });
+
+export interface RunSave {
+  v: 2;
+  seed: number;
+  rng: number;
+  time: number;
+  gold: number;
+  essence: number;
+  infamy: number;
+  eaten: number;
+  escaped: number;
+  champions: number;
+  goldFromKills: number;
+  essenceFromKills: number;
+  mawHp: number;
+  mawLevel: number;
+  rooms: { site: number; id: RoomId; ranks: [number, number, number]; invested: Cost }[];
+  dug: number[];
+  excavated: number[];
+  rumors: { site: number; room: RoomId; until: number }[];
+  nextPartyIn: number;
+  nextChampionAt: number;
+  partyCount: number;
+  tier: number;
+}
+
+interface Group {
   size: number;
   died: number;
   escaped: number;
   done: boolean;
 }
 
-export interface Rumor {
-  feature: FeatureId;
-  until: number;
-}
-
-export type SimEvent =
-  | { t: 'damage'; x: number; y: number; amount: number; on: 'hero' | 'monster'; id: number; crit?: boolean; burn?: boolean }
-  | { t: 'heroDied'; x: number; y: number; gold: number; infamy: number; cls: HeroClass; champion: string | null; gullet: boolean }
-  | { t: 'monsterDied'; x: number; y: number; kind: MonsterKind }
-  | { t: 'trap'; tile: number; feature: FeatureId; crit?: boolean }
-  | { t: 'ignite'; x: number; y: number }
-  | { t: 'status'; x: number; y: number; status: 'sticky' | 'oily' }
-  | { t: 'disarm'; tile: number }
-  | { t: 'spotted'; tile: number }
-  | { t: 'loot'; x: number; y: number; amount: number }
-  | { t: 'bite'; amount: number; stolen: number }
-  | { t: 'chomp'; heroId: number }
-  | { t: 'escaped'; cls: HeroClass; loot: number; rumors: number }
-  | { t: 'party'; size: number; level: number; champion: string | null }
-  | { t: 'heal'; x: number; y: number; amount: number }
-  | { t: 'unlock'; feature: FeatureId }
-  | { t: 'respawn'; tile: number; kind: MonsterKind }
-  | { t: 'wipe'; size: number; infamy: number }
-  | { t: 'ambush'; tile: number }
-  | { t: 'collapse' };
-
-export type ActionResult = { ok: true } | { ok: false; reason: string };
-
-const OK: ActionResult = { ok: true };
-const fail = (reason: string): ActionResult => ({ ok: false, reason });
-
-// ---------------------------------------------------------------- save shape
-
-export interface RunSave {
-  seed: number;
-  rng: number;
-  time: number;
-  gold: number;
-  infamy: number;
-  eaten: number;
-  escaped: number;
-  champions: number;
-  goldFromKills: number;
-  mawHp: number;
-  mawLevel: number;
-  kinds: string;
-  features: { i: number; id: FeatureId; level: number; invested: number }[];
-  rumors: { i: number; feature: FeatureId; until: number }[];
-  nextPartyIn: number;
-  nextChampionAt: number;
-  partyCount: number;
-  unlocked: FeatureId[];
-}
-
 // ---------------------------------------------------------------- the simulation
 
 /**
  * The whole game world, advanced in fixed ticks of BALANCE.dt seconds.
+ * Heroes travel as parties along dug corridors between room sites.
  * Pure TypeScript: rendering, audio and tests all read the same state.
  */
 export class Sim {
-  readonly rng: Rng;
   readonly seed: number;
-  readonly grid: Grid;
+  readonly rng: Rng;
+  readonly cave: Cave;
   readonly mods: MetaMods;
 
   time = 0;
   gold: number;
+  essence: number;
   infamy = 0;
   eaten = 0;
   escaped = 0;
   champions = 0;
   goldFromKills = 0;
+  essenceFromKills = 0;
   mawHp: number;
   mawLevel = 1;
   mawChompT = 0;
   mawLastHitAt = -10;
   mawLastChompAt = -10;
   collapsed = false;
+  /** Highest catalog tier unlocked by Infamy. */
+  tier = 0;
+  /** Bumped on every change to rooms, corridors or excavation. */
+  version = 0;
 
-  heroes: Hero[] = [];
+  rooms = new Map<number, Room>();
+  dug = new Set<number>();
+  excavated = new Set<number>();
   monsters: Monster[] = [];
-  parties = new Map<number, Party>();
+  parties: Party[] = [];
   rumors = new Map<number, Rumor>();
-  unlocked = new Set<FeatureId>();
   events: SimEvent[] = [];
 
   nextPartyIn: number = BALANCE.firstPartyAt;
   nextChampionAt: number = BALANCE.championEvery;
   partyCount = 0;
 
-  private pending: { hero: Hero; delay: number }[] = [];
+  private groups = new Map<number, Group>();
+  private pending: { party: Party; delay: number }[] = [];
   private nextId = 1;
-  private leashCache = new Map<number, Set<number>>();
-  private dangerCache: Float32Array | null = null;
-  private cacheVersion = -1;
   private rumorCheckT = 0;
 
-  constructor(meta: MetaState, seed: number, save?: RunSave) {
+  constructor(meta: MetaState, seed: number, save?: RunSave, cave?: Cave) {
     this.mods = metaMods(meta);
     this.seed = seed;
-    this.rng = new Rng(save ? save.rng : seed);
+    this.cave = cave ?? generateCave(new Rng(seed));
+    this.rng = new Rng(save ? save.rng : (seed ^ 0x5bd1e995) >>> 0);
+    this.gold = BALANCE.startGold + this.mods.startGold;
+    this.essence = BALANCE.startEssence;
+    this.mawHp = 0;
     if (save) {
-      const { gridW, gridH, entrance, maw } = BALANCE;
-      this.grid = Grid.decode(gridW, gridH, entrance.y * gridW + entrance.x, maw.y * gridW + maw.x, save.kinds);
       this.time = save.time;
       this.gold = save.gold;
+      this.essence = save.essence;
       this.infamy = save.infamy;
       this.eaten = save.eaten;
       this.escaped = save.escaped;
       this.champions = save.champions;
       this.goldFromKills = save.goldFromKills;
+      this.essenceFromKills = save.essenceFromKills;
       this.mawLevel = save.mawLevel;
-      this.mawHp = Math.min(save.mawHp, this.mawMaxHp);
       this.nextPartyIn = Math.max(8, save.nextPartyIn);
       this.nextChampionAt = Math.max(save.nextChampionAt, this.time + 30);
       this.partyCount = save.partyCount;
-      for (const f of save.unlocked) this.unlocked.add(f);
-      for (const r of save.rumors) this.rumors.set(r.i, { feature: r.feature, until: r.until });
-      for (const f of save.features) {
-        this.grid.features[f.i] = this.makeFeature(f.id, f.level, f.invested);
-        this.spawnLairMonsters(f.i);
-      }
+      this.tier = save.tier;
+      for (const r of save.excavated) this.excavated.add(r);
+      for (const e of save.dug) this.dug.add(e);
+      for (const r of save.rumors) this.rumors.set(r.site, { room: r.room, until: r.until });
+      for (const r of save.rooms) this.placeRoom(r.site, r.id, r.ranks, r.invested);
+      this.mawHp = Math.min(save.mawHp, this.mawMaxHp);
     } else {
-      this.grid = Grid.createStarter(this.rng);
-      this.gold = BALANCE.startGold + this.mods.startGold;
+      this.excavated.add(0);
+      const route = this.cave.startRoute;
+      for (let i = 0; i + 1 < route.length; i++) {
+        const e = this.edgeBetween(route[i], route[i + 1]);
+        if (e) this.dug.add(e.id);
+      }
       this.mawHp = this.mawMaxHp;
       if (this.mods.headStart) {
-        const g = this.grid;
-        for (const [x, y, id] of [
-          [7, 9, 'slimePit'],
-          [7, 10, 'spikes'],
-        ] as [number, number, FeatureId][]) {
-          const t = g.idx(x, y);
-          g.features[t] = this.makeFeature(id, 1, FEATURES[id].cost);
-          this.spawnLairMonsters(t);
-        }
-        g.touch();
+        const spots = route.filter((s) => this.cave.sites[s].kind === 'site');
+        if (spots[0] !== undefined) this.placeRoom(spots[0], 'spikeHall', [0, 0, 0], { gold: ROOMS.spikeHall.cost.gold, essence: 0 });
+        if (spots[1] !== undefined) this.placeRoom(spots[1], 'goblinWarren', [0, 0, 0], { ...ROOMS.goblinWarren.cost });
+        this.tier = Math.max(this.tier, 1);
       }
     }
-    if (this.mods.headStart) for (const f of ['slimePit', 'larder', 'oil', 'gloom'] as FeatureId[]) this.unlocked.add(f);
-    for (const f of FEATURE_ORDER) if (FEATURES[f].unlockInfamy <= this.infamy) this.unlocked.add(f);
+    this.checkUnlocks(true);
+  }
+
+  // ------------------------------------------------------------ geometry helpers
+
+  site(id: number): Site {
+    return this.cave.sites[id];
+  }
+
+  edgeBetween(a: number, b: number): Edge | null {
+    for (const eid of this.cave.adj[a]) {
+      const e = this.cave.edges[eid];
+      if (otherEnd(e, a) === b) return e;
+    }
+    return null;
+  }
+
+  isExcavated(site: number): boolean {
+    return this.excavated.has(this.site(site).region);
+  }
+
+  /** Sites joined to this one by a dug corridor. */
+  linked(site: number): number[] {
+    const out: number[] = [];
+    for (const eid of this.cave.adj[site]) if (this.dug.has(eid)) out.push(otherEnd(this.cave.edges[eid], site));
+    return out;
+  }
+
+  /** Rooms of a type linked to a site by one corridor. */
+  linkedRooms(site: number, id: RoomId): Room[] {
+    const out: Room[] = [];
+    for (const n of this.linked(site)) {
+      const r = this.rooms.get(n);
+      if (r?.id === id) out.push(r);
+    }
+    return out;
+  }
+
+  private maxRank(rooms: Room[], track: number): number {
+    return rooms.reduce((m, r) => Math.max(m, r.ranks[track]), 0);
+  }
+
+  inRect(site: number, x: number, y: number): boolean {
+    const s = this.site(site);
+    return Math.abs(x - s.x) <= s.w / 2 && Math.abs(y - s.y) <= s.h / 2;
   }
 
   // ------------------------------------------------------------ derived numbers
@@ -262,128 +326,231 @@ export class Sim {
   get partyInterval(): number {
     return Math.max(BALANCE.partyIntervalMin, BALANCE.partyIntervalStart - BALANCE.partyIntervalPerMin * this.minutes);
   }
-  get digCost(): number {
-    return Math.max(1, Math.round(BALANCE.digCost * this.mods.costMul));
+  partyLevel(): number {
+    const m = this.minutes * this.mods.escalationMul;
+    return 1 + BALANCE.heroLevelPerMin * m + BALANCE.heroLevelPerMin2 * m * m + BALANCE.heroLevelPerInfamy * this.infamy;
   }
-  get fillCost(): number {
-    return Math.max(1, Math.round(BALANCE.fillCost * this.mods.costMul));
+  partySize(): number {
+    const m = this.minutes * this.mods.escalationMul;
+    return BALANCE.partySizeBase + BALANCE.partySizePerMin * m + BALANCE.partySizePerMin2 * m * m + BALANCE.partySizePerInfamy * this.infamy;
   }
-  featureCost(id: FeatureId): number {
-    return Math.round(FEATURES[id].cost * this.mods.costMul);
+  threatLabel(): string {
+    return `Lv ${this.partyLevel().toFixed(1)} · ~${Math.max(1, Math.round(this.partySize()))} heroes`;
   }
-  upgradeCost(tile: number): number | null {
-    const f = this.grid.features[tile];
-    if (!f || !FEATURES[f.id].upgradable || f.level >= BALANCE.featureMaxLevel) return null;
-    return Math.round(FEATURES[f.id].cost * BALANCE.upgradeBaseFactor * BALANCE.upgradeGrowth ** (f.level - 1) * this.mods.costMul);
+  get livingHeroes(): number {
+    let n = 0;
+    for (const p of this.parties) n += p.members.length;
+    for (const p of this.pending) n += p.party.members.length;
+    return n;
+  }
+  heroes(): Hero[] {
+    return this.parties.flatMap((p) => p.members);
+  }
+
+  isUnlocked(id: RoomId): boolean {
+    const def = ROOMS[id];
+    if (def.blueprint && !this.mods.blueprints.has(id)) return false;
+    return def.tier <= this.tier;
+  }
+  nextTier(): { tier: number; infamy: number } | null {
+    const t = this.tier + 1;
+    return t < BALANCE.tierInfamy.length ? { tier: t, infamy: BALANCE.tierInfamy[t] } : null;
+  }
+  roomCost(id: RoomId): Cost {
+    const c = ROOMS[id].cost;
+    return { gold: Math.round(c.gold * this.mods.costMul), essence: c.essence };
+  }
+  upgradeCost(site: number, track: number): Cost | null {
+    const r = this.rooms.get(site);
+    if (!r || r.ranks[track] >= 3) return null;
+    const c = trackCost(r.id, r.ranks[track] + 1);
+    return { gold: Math.round(c.gold * this.mods.costMul), essence: c.essence };
+  }
+  corridorCost(edge: number): number {
+    return Math.max(1, Math.round(this.cave.edges[edge].len * BALANCE.corridorCostPerTile * this.mods.costMul));
+  }
+  excavateCost(): number {
+    const n = this.excavated.size - 1;
+    const costs = BALANCE.excavateCosts;
+    return costs[Math.min(n, costs.length - 1)];
   }
   mawUpgradeCost(): number | null {
     if (this.mawLevel >= BALANCE.mawUpgradeMax) return null;
     return Math.round(BALANCE.mawUpgradeBase * BALANCE.mawUpgradeGrowth ** (this.mawLevel - 1) * this.mods.costMul);
   }
-  /** Infamy needed for the next locked feature, or null when all are unlocked. */
-  nextUnlock(): { feature: FeatureId; infamy: number } | null {
-    for (const f of FEATURE_ORDER)
-      if (!this.unlocked.has(f)) return { feature: f, infamy: FEATURES[f].unlockInfamy };
-    return null;
+  private afford(c: Cost): boolean {
+    return this.gold >= c.gold && this.essence >= c.essence;
   }
-  get livingHeroes(): number {
-    return this.heroes.length + this.pending.length;
+  private pay(c: Cost): void {
+    this.gold -= c.gold;
+    this.essence -= c.essence;
+  }
+  private costReason(c: Cost): string {
+    return this.gold < c.gold ? 'Not enough Gold' : 'Not enough Essence';
   }
 
   // ------------------------------------------------------------ player actions
 
-  canDig(i: number): ActionResult {
-    const g = this.grid;
-    if (i < 0 || i >= g.kinds.length) return fail('Off the map');
-    if (g.kinds[i] === 'bedrock') return fail('Bedrock is too hard to dig');
-    if (g.kinds[i] !== 'rock') return fail('Already dug');
-    if (!g.neighbors4(i).some((n) => g.isWalkable(n))) return fail('Must touch the dungeon');
-    if (this.gold < this.digCost) return fail('Not enough Gold');
-    return OK;
-  }
-
-  dig(i: number): ActionResult {
-    const r = this.canDig(i);
-    if (!r.ok) return r;
-    this.gold -= this.digCost;
-    this.grid.kinds[i] = 'floor';
-    this.grid.touch();
-    return OK;
-  }
-
-  canFill(i: number): ActionResult {
-    const g = this.grid;
-    if (i < 0 || i >= g.kinds.length) return fail('Off the map');
-    if (g.kinds[i] !== 'floor') return fail('Only empty tunnel can be filled');
-    if (g.features[i]) return fail('Remove what is built there first');
-    if (this.occupied(i)) return fail('Something is standing there');
-    if (!g.isConnected(i)) return fail('That would block the only way to the Maw');
-    if (this.gold < this.fillCost) return fail('Not enough Gold');
-    return OK;
-  }
-
-  fill(i: number): ActionResult {
-    const r = this.canFill(i);
-    if (!r.ok) return r;
-    this.gold -= this.fillCost;
-    this.grid.kinds[i] = 'rock';
-    this.grid.touch();
-    return OK;
-  }
-
-  canPlace(i: number, id: FeatureId): ActionResult {
-    const g = this.grid;
-    if (i < 0 || i >= g.kinds.length) return fail('Off the map');
-    if (!this.unlocked.has(id)) return fail(`Unlocks at ${FEATURES[id].unlockInfamy} Infamy`);
-    if (g.kinds[i] !== 'floor') return fail(g.kinds[i] === 'rock' ? 'Dig here first' : 'Cannot build here');
-    if (g.features[i]) return fail('Something is already built here');
-    if (this.gold < this.featureCost(id)) return fail('Not enough Gold');
-    return OK;
-  }
-
-  place(i: number, id: FeatureId): ActionResult {
-    const r = this.canPlace(i, id);
-    if (!r.ok) return r;
-    const cost = this.featureCost(id);
-    this.gold -= cost;
-    this.grid.features[i] = this.makeFeature(id, 1, cost);
-    this.spawnLairMonsters(i);
-    this.grid.touch();
-    return OK;
-  }
-
-  canDemolish(i: number): ActionResult {
-    if (!this.grid.features[i]) return fail('Nothing to remove');
-    return OK;
-  }
-
-  demolish(i: number): ActionResult {
-    const f = this.grid.features[i];
-    if (!f) return fail('Nothing to remove');
-    this.gold += Math.floor(f.invested * BALANCE.demolishRefund);
-    this.monsters = this.monsters.filter((m) => m.lair !== i);
-    this.grid.features[i] = null;
-    this.grid.touch();
-    return OK;
-  }
-
-  upgrade(i: number): ActionResult {
-    const f = this.grid.features[i];
-    if (!f) return fail('Nothing to upgrade');
-    const cost = this.upgradeCost(i);
-    if (cost === null) return fail(FEATURES[f.id].upgradable ? 'Already at max level' : 'Rooms cannot be upgraded');
-    if (this.gold < cost) return fail('Not enough Gold');
-    this.gold -= cost;
-    f.level++;
-    f.invested += cost;
-    for (const m of this.monsters) {
-      if (m.lair !== i) continue;
-      const def = MONSTERS[m.kind];
-      m.level = f.level;
-      m.maxHp = def.hp * monsterHpMul(f.level);
-      m.hp = m.maxHp;
-      m.dmg = def.dmg * monsterDmgMul(f.level);
+  canBuild(site: number, id: RoomId): ActionResult {
+    const s = this.cave.sites[site];
+    if (!s || s.kind !== 'site') return fail('Rooms go on empty sites');
+    if (!this.isExcavated(site)) return fail('Excavate this area first');
+    if (this.rooms.has(site)) return fail('Something is already built here');
+    if (!this.isUnlocked(id)) {
+      const def = ROOMS[id];
+      return fail(def.blueprint && !this.mods.blueprints.has(id) ? 'Buy its blueprint with Teeth first' : `Unlocks at ${BALANCE.tierInfamy[def.tier]} Infamy`);
     }
+    const c = this.roomCost(id);
+    if (!this.afford(c)) return fail(this.costReason(c));
+    return OK;
+  }
+
+  build(site: number, id: RoomId): ActionResult {
+    const r = this.canBuild(site, id);
+    if (!r.ok) return r;
+    const c = this.roomCost(id);
+    this.pay(c);
+    this.placeRoom(site, id, [0, 0, 0], { ...c });
+    this.version++;
+    return OK;
+  }
+
+  private placeRoom(site: number, id: RoomId, ranks: [number, number, number], invested: Cost): void {
+    const def = ROOMS[id];
+    const room: Room = { site, id, ranks: [...ranks] as [number, number, number], invested, slots: [], trapT: 0 };
+    this.rooms.set(site, room);
+    if (def.monster) {
+      const count = this.monsterCount(room);
+      for (let s = 0; s < count; s++) {
+        room.slots.push({ monsterId: null, respawn: 0 });
+        this.spawnMonster(room, s);
+      }
+    }
+  }
+
+  sell(site: number): ActionResult {
+    const r = this.rooms.get(site);
+    if (!r) return fail('Nothing to sell');
+    this.gold += Math.floor(r.invested.gold * BALANCE.sellRefund);
+    this.essence += Math.floor(r.invested.essence * BALANCE.sellRefund);
+    this.monsters = this.monsters.filter((m) => m.site !== site);
+    this.rooms.delete(site);
+    this.version++;
+    return OK;
+  }
+
+  canUpgrade(site: number, track: number): ActionResult {
+    const r = this.rooms.get(site);
+    if (!r) return fail('Nothing to upgrade');
+    const c = this.upgradeCost(site, track);
+    if (!c) return fail('Already maxed');
+    if (!this.afford(c)) return fail(this.costReason(c));
+    return OK;
+  }
+
+  upgrade(site: number, track: number): ActionResult {
+    const res = this.canUpgrade(site, track);
+    if (!res.ok) return res;
+    const r = this.rooms.get(site)!;
+    const c = this.upgradeCost(site, track)!;
+    this.pay(c);
+    r.invested.gold += c.gold;
+    r.invested.essence += c.essence;
+    r.ranks[track]++;
+    // New monster slots appear straight away.
+    if (ROOMS[r.id].monster) {
+      while (r.slots.length < this.monsterCount(r)) {
+        r.slots.push({ monsterId: null, respawn: 0 });
+        this.spawnMonster(r, r.slots.length - 1);
+      }
+    }
+    this.version++;
+    this.refreshMonsters();
+    return OK;
+  }
+
+  canDig(edge: number): ActionResult {
+    const e = this.cave.edges[edge];
+    if (!e) return fail('No corridor there');
+    if (this.dug.has(edge)) return fail('Already dug');
+    if (!this.isExcavated(e.a) || !this.isExcavated(e.b)) return fail('Excavate both ends first');
+    if (this.gold < this.corridorCost(edge)) return fail('Not enough Gold');
+    return OK;
+  }
+
+  dig(edge: number): ActionResult {
+    const r = this.canDig(edge);
+    if (!r.ok) return r;
+    this.gold -= this.corridorCost(edge);
+    this.dug.add(edge);
+    this.version++;
+    this.refreshMonsters();
+    return OK;
+  }
+
+  canFill(edge: number): ActionResult {
+    if (!this.dug.has(edge)) return fail('Nothing to fill');
+    const e = this.cave.edges[edge];
+    if (this.parties.some((p) => (p.from === e.a && p.to === e.b) || (p.from === e.b && p.to === e.a))) return fail('Heroes are in that corridor');
+    if (!this.connected(edge)) return fail('That would cut the Maw off from the gate');
+    return OK;
+  }
+
+  fill(edge: number): ActionResult {
+    const r = this.canFill(edge);
+    if (!r.ok) return r;
+    this.dug.delete(edge);
+    this.gold += Math.floor(this.corridorCost(edge) * BALANCE.sellRefund);
+    this.version++;
+    this.refreshMonsters();
+    return OK;
+  }
+
+  /** Is the gate connected to the Maw (optionally pretending one corridor is gone)? */
+  connected(withoutEdge = -1): boolean {
+    const seen = new Set<number>([this.cave.gate]);
+    const stack = [this.cave.gate];
+    while (stack.length) {
+      const c = stack.pop()!;
+      if (c === this.cave.maw) return true;
+      for (const eid of this.cave.adj[c]) {
+        if (eid === withoutEdge || !this.dug.has(eid)) continue;
+        const n = otherEnd(this.cave.edges[eid], c);
+        if (!seen.has(n)) {
+          seen.add(n);
+          stack.push(n);
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Regions that border what you have already dug out. */
+  excavatable(): number[] {
+    const out = new Set<number>();
+    for (const e of this.cave.edges) {
+      const ra = this.site(e.a).region;
+      const rb = this.site(e.b).region;
+      if (this.excavated.has(ra) && !this.excavated.has(rb)) out.add(rb);
+      if (this.excavated.has(rb) && !this.excavated.has(ra)) out.add(ra);
+    }
+    return [...out].sort((a, b) => a - b);
+  }
+
+  canExcavate(region: number): ActionResult {
+    if (this.excavated.has(region)) return fail('Already excavated');
+    if (!this.excavatable().includes(region)) return fail('Dig out a neighboring area first');
+    if (this.essence < this.excavateCost()) return fail('Not enough Essence');
+    return OK;
+  }
+
+  excavate(region: number): ActionResult {
+    const r = this.canExcavate(region);
+    if (!r.ok) return r;
+    this.essence -= this.excavateCost();
+    this.excavated.add(region);
+    this.version++;
+    this.events.push({ t: 'excavated', region });
     return OK;
   }
 
@@ -398,7 +565,6 @@ export class Sim {
     return OK;
   }
 
-  /** End this dungeon right now (the player chose to collapse it). */
   forceCollapse(): void {
     if (this.collapsed) return;
     this.mawHp = 0;
@@ -406,62 +572,58 @@ export class Sim {
     this.events.push({ t: 'collapse' });
   }
 
-  private occupied(i: number): boolean {
-    const g = this.grid;
-    return (
-      this.heroes.some((h) => g.tileAt(h.x, h.y) === i || h.tile === i) ||
-      this.monsters.some((m) => g.tileAt(m.x, m.y) === i)
-    );
+  // ------------------------------------------------------------ monsters
+
+  private monsterCount(r: Room): number {
+    const def = ROOMS[r.id];
+    const extra = r.id === 'goblinWarren' || r.id === 'boneCrypt' || r.id === 'spiderNest' ? r.ranks[0] : 0;
+    return (def.count ?? 0) + extra;
   }
 
-  private makeFeature(id: FeatureId, level: number, invested: number): Feature {
-    const def = FEATURES[id];
-    const slots = def.category === 'lair' ? Array.from({ length: def.count ?? 1 }, () => ({ monsterId: null, respawn: 0 })) : [];
-    return { id, level, invested, rearm: 0, slots };
+  private monsterHpMul(r: Room): number {
+    let mul = 1 + 0.15 * this.maxRank(this.linkedRooms(r.site, 'larder'), 1);
+    if (r.id === 'slimePit') mul *= 1 + 0.35 * r.ranks[0];
+    if (r.id === 'trollDen') mul *= 1 + 0.3 * r.ranks[0];
+    return mul;
   }
 
-  private spawnLairMonsters(tile: number): void {
-    const f = this.grid.features[tile];
-    if (!f || FEATURES[f.id].category !== 'lair') return;
-    f.slots.forEach((slot, s) => {
-      if (slot.monsterId === null) this.spawnMonster(tile, f, s);
-    });
+  monsterDamage(m: Monster): number {
+    const r = this.rooms.get(m.site);
+    const def = MONSTERS[m.kind];
+    let mul = 1;
+    if (r) {
+      mul *= 1 + 0.12 * this.maxRank(this.linkedRooms(r.site, 'larder'), 2);
+      if (r.id === 'goblinWarren') mul *= 1 + 0.3 * r.ranks[1];
+      if (r.id === 'mimicVault') mul *= 1 + 0.3 * r.ranks[0];
+    }
+    return def.dmg * mul;
   }
 
-  private spawnMonster(tile: number, f: Feature, slot: number): Monster {
-    const kind = FEATURES[f.id].monster!;
-    const def = MONSTERS[kind];
-    const g = this.grid;
-    const count = f.slots.length;
-    const offset = count > 1 ? (slot === 0 ? -0.22 : 0.22) : 0;
-    const m: Monster = {
-      id: this.nextId++,
-      kind,
-      lair: tile,
-      slot,
-      level: f.level,
-      hp: def.hp * monsterHpMul(f.level),
-      maxHp: def.hp * monsterHpMul(f.level),
-      dmg: def.dmg * monsterDmgMul(f.level),
-      cooldown: def.cooldown,
-      speed: def.speed,
-      x: g.x(tile) + offset,
-      y: g.y(tile) - offset,
-      px: g.x(tile) + offset,
-      py: g.y(tile) - offset,
-      homeX: g.x(tile) + offset,
-      homeY: g.y(tile) - offset,
-      atk: 0,
-      targetId: null,
-      ambush: true,
-      idleT: 0,
-      facing: 1,
-      lastHitAt: -10,
-      lastAttackAt: -10,
-    };
-    f.slots[slot].monsterId = m.id;
+  private respawnMul(r: Room): number {
+    const larders = this.linkedRooms(r.site, 'larder');
+    if (!larders.length) return 1;
+    return 2 + 0.5 * this.maxRank(larders, 0);
+  }
+
+  private spawnMonster(r: Room, slot: number): void {
+    const kind = ROOMS[r.id].monster!;
+    const hp = MONSTERS[kind].hp * this.monsterHpMul(r);
+    const m: Monster = { id: this.nextId++, kind, site: r.site, slot, hp, maxHp: hp, atk: 0.5, down: 0, reassembled: false, ambush: true, targetId: null, lastHitAt: -10, lastAttackAt: -10 };
+    r.slots[slot].monsterId = m.id;
     this.monsters.push(m);
-    return m;
+  }
+
+  /** Re-apply HP multipliers after upgrades or new links. */
+  private refreshMonsters(): void {
+    for (const m of this.monsters) {
+      const r = this.rooms.get(m.site);
+      if (!r) continue;
+      const max = MONSTERS[m.kind].hp * this.monsterHpMul(r);
+      if (Math.abs(max - m.maxHp) > 0.01) {
+        m.hp = (m.hp / m.maxHp) * max;
+        m.maxHp = max;
+      }
+    }
   }
 
   // ------------------------------------------------------------ tick
@@ -471,27 +633,24 @@ export class Sim {
     const dt = BALANCE.dt;
     this.time += dt;
     if (this.events.length > 4000) this.events.splice(0, this.events.length - 2000);
-
-    for (const h of this.heroes) {
-      h.px = h.x;
-      h.py = h.y;
-    }
-    for (const m of this.monsters) {
-      m.px = m.x;
-      m.py = m.y;
+    for (const p of this.parties) {
+      p.px = p.x;
+      p.py = p.y;
     }
 
     this.gold += BALANCE.passiveGoldPerSec * dt;
-    this.refreshCaches();
+    for (const r of this.rooms.values()) if (r.id === 'soulWell') this.essence += (0.2 + 0.15 * r.ranks[0]) * dt;
+
     this.tickSpawning(dt);
-    this.tickFeatures(dt);
+    this.tickRooms(dt);
     this.tickHeroes(dt);
-    this.tickMonsters(dt);
-    this.tickTraps();
+    this.tickParties(dt);
+    this.tickCombat(dt);
+    this.tickTraps(dt);
     this.tickMaw(dt);
     this.cleanup();
     this.tickRumors(dt);
-    this.checkUnlocks();
+    this.checkUnlocks(false);
 
     if (this.mawHp <= 0) {
       this.mawHp = 0;
@@ -500,31 +659,7 @@ export class Sim {
     }
   }
 
-  private refreshCaches(): void {
-    if (this.cacheVersion === this.grid.version) return;
-    this.cacheVersion = this.grid.version;
-    this.leashCache.clear();
-    const g = this.grid;
-    const danger = new Float32Array(g.w * g.h);
-    for (const t of g.featureTiles()) {
-      const f = g.features[t]!;
-      if (f.id !== 'goblinDen' && f.id !== 'slimePit') continue;
-      danger[t] += BALANCE.lairFear;
-      for (const n of g.neighbors8(t)) danger[n] += BALANCE.lairNearFear;
-    }
-    this.dangerCache = danger;
-  }
-
-  private leashArea(lair: number, kind: MonsterKind): Set<number> {
-    let a = this.leashCache.get(lair);
-    if (!a) {
-      a = this.grid.area(lair, MONSTERS[kind].leash);
-      this.leashCache.set(lair, a);
-    }
-    return a;
-  }
-
-  // ------------------------------------------------------------ parties
+  // ------------------------------------------------------------ parties: spawning
 
   private tickSpawning(dt: number): void {
     this.nextPartyIn -= dt;
@@ -540,713 +675,868 @@ export class Sim {
       const p = this.pending[k];
       p.delay -= dt;
       if (p.delay <= 0) {
-        this.heroes.push(p.hero);
+        this.parties.push(p.party);
+        this.plan(p.party);
         this.pending.splice(k, 1);
       }
     }
   }
 
-  /** Expected hero level for a party spawned now. */
-  partyLevel(): number {
-    const m = this.minutes * this.mods.escalationMul;
-    return 1 + BALANCE.heroLevelPerMin * m + BALANCE.heroLevelPerMin2 * m * m + BALANCE.heroLevelPerInfamy * this.infamy;
-  }
-
-  /** Expected party size for a party spawned now. */
-  partySize(): number {
-    const m = this.minutes * this.mods.escalationMul;
-    return BALANCE.partySizeBase + BALANCE.partySizePerMin * m + BALANCE.partySizePerMin2 * m * m + BALANCE.partySizePerInfamy * this.infamy;
+  private newParty(members: Hero[], at: number): Party {
+    const s = this.site(at);
+    const party: Party = {
+      id: this.nextId++,
+      members,
+      known: new Map(),
+      disarmed: new Set(),
+      looted: new Set(),
+      goal: 'maw',
+      target: this.cave.maw,
+      route: [],
+      from: at,
+      to: at,
+      d: 0,
+      len: 0,
+      x: s.x,
+      y: s.y,
+      px: s.x,
+      py: s.y,
+      state: 'move',
+      lootT: 0,
+      inside: at,
+    };
+    for (const [site, r] of this.rumors) party.known.set(site, r.room);
+    return party;
   }
 
   spawnParty(champion: boolean): void {
     const rng = this.rng;
-    const g = this.grid;
     const size = Math.max(1, Math.min(BALANCE.partySizeMax, Math.round(this.partySize() + rng.range(-0.5, 0.5))));
     const levelF = this.partyLevel();
-    const party: Party = { id: ++this.partyCount, known: new Map(), version: 0, size: 0, died: 0, escaped: 0, done: false };
-    for (const [tile, r] of this.rumors) party.known.set(tile, r.feature);
-    this.parties.set(party.id, party);
-
-    // Rumors shape who answers the call: trap stories bring rogues, monster stories bring knights.
+    const group = ++this.partyCount;
     let trapRumors = 0;
-    for (const r of this.rumors.values()) if (FEATURES[r.feature].category === 'trap') trapRumors++;
+    for (const r of this.rumors.values()) if (ROOMS[r.room].kind === 'trap') trapRumors++;
     let lairs = 0;
-    for (const t of g.featureTiles()) if (FEATURES[g.features[t]!.id].category === 'lair') lairs++;
+    for (const r of this.rooms.values()) if (ROOMS[r.id].kind === 'monster') lairs++;
     const weights: [HeroClass, number][] = [
-      ['knight', 1 + Math.min(1.2, lairs * 0.1)],
-      ['rogue', 0.8 + Math.min(2, trapRumors * 0.3)],
+      ['knight', 1 + Math.min(1.2, lairs * 0.12)],
+      ['rogue', 0.8 + Math.min(2, trapRumors * 0.35)],
       ['cleric', 0.8 + Math.min(1, this.escaped * 0.02)],
     ];
-
     const members: Hero[] = [];
     for (let k = 0; k < size; k++) {
       const level = Math.max(1, Math.round(levelF + rng.range(-0.6, 0.6)));
-      members.push(this.makeHero(rng.weighted(weights), level, party.id, null));
+      members.push(this.makeHero(rng.weighted(weights), level, group, null));
     }
     let champName: string | null = null;
     if (champion) {
       champName = rng.pick(CHAMPION_NAMES);
       const cls = rng.pick(['knight', 'rogue', 'cleric'] as HeroClass[]);
-      const champ = this.makeHero(cls, Math.round(levelF) + BALANCE.championLevelBonus, party.id, champName);
-      members.splice(Math.floor(members.length / 2), 0, champ);
+      members.unshift(this.makeHero(cls, Math.round(levelF) + BALANCE.championLevelBonus, group, champName));
     }
-    party.size = members.length;
-    members.forEach((hero, k) => this.pending.push({ hero, delay: k * BALANCE.spawnStagger }));
+    this.groups.set(group, { size: members.length, died: 0, escaped: 0, done: false });
+    // Knights lead, Clerics stay in the middle.
+    const order = { knight: 0, cleric: 1, rogue: 2 };
+    members.sort((a, b) => order[a.cls] - order[b.cls]);
+    this.pending.push({ party: this.newParty(members, this.cave.gate), delay: 0 });
     this.events.push({ t: 'party', size: members.length, level: Math.round(levelF), champion: champName });
   }
 
-  /** Adds one hero at the entrance right now (tests and debugging). */
-  spawnHero(cls: HeroClass, level = 1, partyId?: number): Hero {
-    let party = partyId !== undefined ? this.parties.get(partyId) : undefined;
-    if (!party) {
-      party = { id: ++this.partyCount, known: new Map(), version: 0, size: 0, died: 0, escaped: 0, done: false };
-      for (const [tile, r] of this.rumors) party.known.set(tile, r.feature);
-      this.parties.set(party.id, party);
-    }
-    party.size++;
-    const h = this.makeHero(cls, level, party.id, null);
-    this.heroes.push(h);
-    return h;
+  /** Adds a party right now (tests and debugging). */
+  spawnHeroes(classes: HeroClass[], level = 1): Party {
+    const group = ++this.partyCount;
+    const members = classes.map((c) => this.makeHero(c, level, group, null));
+    this.groups.set(group, { size: members.length, died: 0, escaped: 0, done: false });
+    const party = this.newParty(members, this.cave.gate);
+    this.parties.push(party);
+    this.plan(party);
+    return party;
   }
 
-  private makeHero(cls: HeroClass, level: number, partyId: number, champion: string | null): Hero {
+  private makeHero(cls: HeroClass, level: number, group: number, champion: string | null): Hero {
     const def = HEROES[cls];
-    const g = this.grid;
-    const hpMul = champion ? BALANCE.championHpMul : 1;
-    const dmgMul = champion ? BALANCE.championDmgMul : 1;
-    const maxHp = def.hp * heroHpMul(level) * hpMul;
-    const ex = g.x(g.entrance);
-    const ey = g.y(g.entrance);
+    const maxHp = def.hp * heroHpMul(level) * (champion ? BALANCE.championHpMul : 1);
     return {
       id: this.nextId++,
       cls,
       level,
-      partyId,
       champion,
+      group,
       hp: maxHp,
       maxHp,
-      dmg: def.dmg * heroDmgMul(level) * dmgMul,
+      dmg: def.dmg * heroDmgMul(level) * (champion ? BALANCE.championDmgMul : 1),
       cooldown: def.cooldown,
-      speed: def.speed * this.rng.range(0.94, 1.06),
+      speed: def.speed * this.rng.range(0.95, 1.05),
       armor: def.armor * (1 + 0.15 * (level - 1)),
-      x: ex,
-      y: ey,
-      px: ex,
-      py: ey,
-      tile: g.entrance,
-      path: [],
-      pathIdx: 0,
-      target: g.maw,
-      goal: 'maw',
-      state: 'walk',
-      planVersion: '',
       atk: 0,
-      lootT: 0,
       healT: def.heal?.interval ?? 0,
       loot: 0,
-      looted: [],
-      lootsLeft: def.maxLoots,
+      lootsLeft: cls === 'rogue' ? 2 : 1,
       bites: 0,
       sticky: 0,
       oily: 0,
       burning: 0,
       burnDps: 0,
-      burnAcc: 0,
-      spotRolled: [],
-      disarmTried: [],
-      facing: 1,
+      bleed: 0,
+      bleedDps: 0,
+      poison: 0,
+      poisonDps: 0,
+      cursed: 0,
+      cursedDps: 0,
+      dotAcc: 0,
+      dead: false,
       lastHitAt: -10,
       lastAttackAt: -10,
     };
   }
 
-  // ------------------------------------------------------------ features
+  // ------------------------------------------------------------ parties: routing
 
-  private tickFeatures(dt: number): void {
-    const g = this.grid;
-    for (const t of g.featureTiles()) {
-      const f = g.features[t]!;
-      const def = FEATURES[f.id];
-      if (def.category === 'trap' && f.rearm > 0) {
-        f.rearm -= dt * (g.touches(t, 'hoard') ? 2 : 1);
-      } else if (def.category === 'lair') {
-        const fed = g.touches(t, 'larder');
-        f.slots.forEach((slot, s) => {
-          if (slot.monsterId !== null) return;
-          slot.respawn -= dt * (fed ? 2 : 1);
-          if (slot.respawn <= 0) {
-            this.spawnMonster(t, f, s);
-            this.events.push({ t: 'respawn', tile: t, kind: def.monster! });
-          }
-        });
+  /** How dangerous heroes believe a site is, from what they know. */
+  private believedDanger(site: number, known: Map<number, RoomId>): number {
+    const room = this.rooms.get(site);
+    if (!room) return 0;
+    const k = known.get(site);
+    if (!k) return ROOMS[room.id].kind === 'lure' || room.id === 'mimicVault' ? 0 : BALANCE.unknownRoomFear;
+    if (k === 'vault') return 0;
+    const ranks = k === room.id ? room.ranks[0] + room.ranks[1] + room.ranks[2] : 0;
+    return ROOMS[k].danger + ranks * BALANCE.dangerPerRank;
+  }
+
+  /** Dijkstra over dug corridors. Cost is seconds of walking plus fear of what lies ahead. */
+  private routeField(start: number, speed: number, fear: number, known: Map<number, RoomId>): { dist: number[]; prev: number[] } {
+    const n = this.cave.sites.length;
+    const dist = new Array<number>(n).fill(Infinity);
+    const prev = new Array<number>(n).fill(-1);
+    const done = new Array<boolean>(n).fill(false);
+    dist[start] = 0;
+    for (;;) {
+      let u = -1;
+      for (let i = 0; i < n; i++) if (!done[i] && Number.isFinite(dist[i]) && (u < 0 || dist[i] < dist[u])) u = i;
+      if (u < 0) break;
+      done[u] = true;
+      for (const eid of this.cave.adj[u]) {
+        if (!this.dug.has(eid)) continue;
+        const e = this.cave.edges[eid];
+        const v = otherEnd(e, u);
+        if (!this.isExcavated(v)) continue;
+        const c = e.len / speed + fear * BALANCE.fearScale * this.believedDanger(v, known);
+        if (dist[u] + c < dist[v]) {
+          dist[v] = dist[u] + c;
+          prev[v] = u;
+        }
       }
     }
+    return { dist, prev };
   }
 
-  // ------------------------------------------------------------ heroes
-
-  /** Price of stepping onto tile i for this hero, given what its party knows. */
-  private costFn(h: Hero): (i: number) => number {
-    const g = this.grid;
-    const fear = HEROES[h.cls].fear * (h.champion ? 0.3 : 1) * (h.goal === 'flee' ? 1.5 : 1);
-    const known = this.parties.get(h.partyId)?.known;
-    return this.makeCostFn(fear, known ?? new Map(), g);
-  }
-
-  private makeCostFn(fear: number, known: Map<number, FeatureId>, g: Grid): (i: number) => number {
-    const danger = this.dangerCache!;
-    const gloomExtra = 1 / BALANCE.gloomSlow - 1;
-    return (i: number) => {
-      let c = 1 + fear * danger[i];
-      const k = known.get(i);
-      if (k) {
-        const cat = FEATURES[k].category;
-        if (cat === 'trap') c += fear * BALANCE.knownTrapFear;
-        else if (k === 'mimic') c += fear * BALANCE.lairFear;
-      }
-      if (g.features[i]?.id === 'gloom') c += gloomExtra;
-      return c;
-    };
-  }
-
-  /** Tiles a hero treats as treasure: Hoards, plus Mimics nobody has warned it about. */
-  private lootCandidates(known: Map<number, FeatureId>): number[] {
-    const g = this.grid;
+  private pathFrom(prev: number[], start: number, goal: number): number[] | null {
+    if (goal === start) return [start];
+    if (prev[goal] < 0) return null;
     const out: number[] = [];
-    for (const t of g.featureTiles()) {
-      const id = g.features[t]!.id;
-      if (id === 'hoard' || (id === 'mimic' && known.get(t) !== 'mimic')) out.push(t);
+    for (let c = goal; c !== -1; c = prev[c]) {
+      out.push(c);
+      if (c === start) break;
+    }
+    if (out[out.length - 1] !== start) return null;
+    return out.reverse();
+  }
+
+  /** Vault sites (including disguised Mimics) the heroes can see glittering. */
+  private vaultSites(known: Map<number, RoomId>): number[] {
+    const out: number[] = [];
+    for (const r of this.rooms.values()) {
+      if (r.id === 'vault' || (r.id === 'mimicVault' && known.get(r.site) !== 'mimicVault')) out.push(r.site);
     }
     return out;
   }
 
-  /** Choose where to go next and how to get there. */
-  private plan(h: Hero): void {
-    const g = this.grid;
-    const party = this.parties.get(h.partyId);
-    h.planVersion = `${g.version}:${party?.version ?? 0}:${h.goal}`;
-
-    let start = g.tileAt(h.x, h.y);
-    if (start < 0 || !g.isWalkable(start)) start = g.isWalkable(h.tile) ? h.tile : g.entrance;
-    const cost = this.costFn(h);
-    const field = dijkstra(g, start, cost);
-
-    let target = g.maw;
-    if (h.goal === 'flee') {
-      target = g.entrance;
-    } else {
-      h.goal = 'maw';
-      const greed = HEROES[h.cls].greed;
-      if (h.lootsLeft > 0 && greed > 0) {
-        const candidates = this.lootCandidates(party?.known ?? new Map()).filter((c) => !h.looted.includes(c));
-        if (candidates.length) {
-          const fromMaw = dijkstra(g, g.maw, cost);
-          const direct = field.dist[g.maw];
-          let best = 0;
-          for (const c of candidates) {
-            if (!Number.isFinite(field.dist[c])) continue;
-            const detour = field.dist[c] + fromMaw.dist[c] - direct;
-            const score = greed * BALANCE.hoardAppeal - detour * BALANCE.detourWeight;
-            if (score > best) {
-              best = score;
-              target = c;
-            }
-          }
-          if (target !== g.maw) h.goal = 'loot';
-        }
-      }
-    }
-
-    h.target = target;
-    const path = pathTo(field, target);
-    if (path === null) {
-      // Nowhere to go (should not happen: the dungeon always stays connected).
-      h.path = [];
-      h.pathIdx = 0;
-      return;
-    }
-    h.path = [start, ...path];
-    h.pathIdx = 0;
+  private vaultAppeal(site: number): number {
+    const r = this.rooms.get(site);
+    const rank = r?.id === 'vault' ? r.ranks[0] : 0;
+    return BALANCE.vaultAppeal * (1 + 0.35 * rank);
   }
 
-  private tickHeroes(dt: number): void {
-    for (const h of this.heroes) {
-      if (h.state === 'dead' || h.state === 'escaped') continue;
-      const def = HEROES[h.cls];
-
-      // Status effects
-      if (h.sticky > 0) h.sticky -= dt;
-      if (h.oily > 0) h.oily -= dt;
-      if (h.burning > 0) {
-        h.burning -= dt;
-        h.burnAcc += h.burnDps * dt;
-        if (h.burnAcc >= 3 || (h.burning <= 0 && h.burnAcc > 0)) {
-          const amt = h.burnAcc;
-          h.burnAcc = 0;
-          this.damageHero(h, amt, { pierce: true, burn: true });
-          if (h.hp <= 0) continue;
-        }
-      }
-      if (h.atk > 0) h.atk -= dt;
-
-      // Cleric healing
-      if (def.heal) {
-        h.healT -= dt;
-        if (h.healT <= 0) {
-          h.healT = def.heal.interval;
-          let best: Hero | null = null;
-          for (const o of this.heroes) {
-            if (o.state === 'dead' || o.state === 'escaped' || o.hp >= o.maxHp) continue;
-            if (Math.hypot(o.x - h.x, o.y - h.y) > def.heal.radius) continue;
-            if (!best || o.hp / o.maxHp < best.hp / best.maxHp) best = o;
-          }
-          if (best) {
-            const amt = Math.min(best.maxHp - best.hp, def.heal.amount * heroDmgMul(h.level));
-            best.hp += amt;
-            this.events.push({ t: 'heal', x: best.x, y: best.y, amount: amt });
-          }
-        }
-      }
-
-      // Running scared
-      if (h.goal !== 'flee' && def.fleeAt > 0 && !h.champion && h.hp / h.maxHp < def.fleeAt) {
-        this.startFleeing(h);
-      }
-
-      if (h.state === 'loot') {
-        h.lootT -= dt;
-        if (h.lootT <= 0) this.finishLoot(h);
-        continue;
-      }
-      if (h.state === 'bite') {
-        this.tickBite(h);
-        continue;
-      }
-
-      // Fight anything in reach (unless running away).
-      if (h.goal !== 'flee') {
-        const foe = this.nearestMonster(h.x, h.y, BALANCE.meleeRange);
-        if (foe) {
-          h.state = 'fight';
-          h.facing = this.faceToward(h.x, h.y, foe.x, foe.y, h.facing);
-          if (h.atk <= 0) {
-            h.atk = h.cooldown;
-            h.lastAttackAt = this.time;
-            this.damageMonster(foe, h.dmg);
-          }
-          continue;
-        }
-      }
-      h.state = 'walk';
-      this.walk(h, dt);
-    }
-  }
-
-  private nearestMonster(x: number, y: number, range: number): Monster | null {
-    let best: Monster | null = null;
-    let bestD = range;
-    for (const m of this.monsters) {
-      if (m.hp <= 0) continue;
-      const d = Math.hypot(m.x - x, m.y - y);
-      if (d <= bestD) {
-        bestD = d;
-        best = m;
-      }
+  /** Best treasure detour for given weights: [site, score] or null. */
+  private bestVault(start: number, speed: number, fear: number, greed: number, known: Map<number, RoomId>, looted: Set<number>): [number, number] | null {
+    if (greed <= 0) return null;
+    const vaults = this.vaultSites(known).filter((v) => !looted.has(v));
+    if (!vaults.length) return null;
+    const a = this.routeField(start, speed, fear, known);
+    const b = this.routeField(this.cave.maw, speed, fear, known);
+    const direct = a.dist[this.cave.maw];
+    let best: [number, number] | null = null;
+    for (const v of vaults) {
+      if (!Number.isFinite(a.dist[v])) continue;
+      const detour = a.dist[v] + b.dist[v] - direct;
+      const score = greed * this.vaultAppeal(v) - detour * BALANCE.detourWeight;
+      if (score > 0 && (!best || score > best[1])) best = [v, score];
     }
     return best;
   }
 
-  private faceToward(x: number, y: number, tx: number, ty: number, current: 1 | -1): 1 | -1 {
-    // Screen-space x in the isometric view is (x - y).
-    const sx = tx - ty - (x - y);
-    if (Math.abs(sx) < 0.01) return current;
-    return sx > 0 ? 1 : -1;
+  private partyWeights(p: Party): { speed: number; fear: number; greed: number } {
+    let fear = 0;
+    let greed = 0;
+    let speed = Infinity;
+    for (const h of p.members) {
+      const def = HEROES[h.cls];
+      fear += def.fear * (h.champion ? 0.3 : 1);
+      greed += def.greed;
+      speed = Math.min(speed, h.speed);
+    }
+    const n = Math.max(1, p.members.length);
+    return { speed: Number.isFinite(speed) ? speed : 2, fear: (fear / n) * (p.goal === 'flee' ? 1.5 : 1), greed: greed / n };
   }
 
-  private walk(h: Hero, dt: number): void {
-    const g = this.grid;
-    const party = this.parties.get(h.partyId);
-    const version = `${g.version}:${party?.version ?? 0}:${h.goal}`;
-    if (h.planVersion !== version || h.pathIdx >= h.path.length) {
-      if (h.pathIdx >= h.path.length && h.planVersion === version) {
-        this.arrive(h);
-        if (h.state !== 'walk') return;
+  /** Pick a destination and route from the site the party is standing at. */
+  private plan(p: Party): void {
+    const at = p.to;
+    const w = this.partyWeights(p);
+    if (p.goal === 'flee') {
+      p.target = this.cave.gate;
+    } else {
+      p.goal = 'maw';
+      p.target = this.cave.maw;
+      const best = this.bestVault(at, w.speed, w.fear, w.greed, p.known, p.looted);
+      if (best) {
+        p.goal = 'loot';
+        p.target = best[0];
       }
-      this.plan(h);
     }
+    const field = this.routeField(at, w.speed, w.fear, p.known);
+    p.route = this.pathFrom(field.prev, at, p.target) ?? [at];
+  }
 
-    let slow = 1;
-    if (h.sticky > 0) slow *= BALANCE.stickySlow;
-    if (h.oily > 0) slow *= BALANCE.oilySlow;
-    const here = g.tileAt(h.x, h.y);
-    if (here >= 0 && g.features[here]?.id === 'gloom') slow *= BALANCE.gloomSlow;
-    let budget = h.speed * slow * dt;
+  /** The route a party of one hero of this class would take from the gate right now. */
+  previewRoute(cls: HeroClass): number[] {
+    const def = HEROES[cls];
+    const known = new Map<number, RoomId>();
+    for (const [site, r] of this.rumors) known.set(site, r.room);
+    const gate = this.cave.gate;
+    const best = this.bestVault(gate, def.speed, def.fear, def.greed, known, new Set());
+    const field = this.routeField(gate, def.speed, def.fear, known);
+    if (!best) return this.pathFrom(field.prev, gate, this.cave.maw) ?? [];
+    const first = this.pathFrom(field.prev, gate, best[0]) ?? [];
+    const second = this.pathFrom(this.routeField(best[0], def.speed, def.fear, known).prev, best[0], this.cave.maw) ?? [];
+    return [...first, ...second.slice(1)];
+  }
 
-    while (budget > 0 && h.pathIdx < h.path.length) {
-      const t = h.path[h.pathIdx];
-      const tx = g.x(t);
-      const ty = g.y(t);
-      const dx = tx - h.x;
-      const dy = ty - h.y;
-      const d = Math.hypot(dx, dy);
-      if (d > 1e-6) h.facing = this.faceToward(h.x, h.y, tx, ty, h.facing);
-      if (d <= budget) {
-        h.x = tx;
-        h.y = ty;
-        budget -= d;
-        h.pathIdx++;
-        if (t !== h.tile) {
-          h.tile = t;
-          this.onEnter(h, t);
-        }
-        if (h.pathIdx >= h.path.length) {
-          this.arrive(h);
-          return;
-        }
-      } else {
-        h.x += (dx / d) * budget;
-        h.y += (dy / d) * budget;
-        budget = 0;
+  // ------------------------------------------------------------ parties: movement
+
+  private speedOf(p: Party): number {
+    let speed = Infinity;
+    for (const h of p.members) {
+      let s = h.speed;
+      if (h.sticky > 0) s *= BALANCE.stickySlow;
+      if (h.cursed > 0) s *= 0.75;
+      speed = Math.min(speed, s);
+    }
+    if (!Number.isFinite(speed)) return 0;
+    if (p.inside >= 0) speed *= this.roomSlow(p.inside);
+    return speed;
+  }
+
+  /** Crossing-speed multiplier for a room. */
+  private roomSlow(site: number): number {
+    const r = this.rooms.get(site);
+    let mul = 1;
+    if (r?.id === 'oilCellar') mul /= 1.4 + 0.25 * r.ranks[1];
+    if (r?.id === 'gloomHall') mul /= 1.4;
+    if (r?.id === 'spiderNest') mul /= 1 + 0.25 * r.ranks[2];
+    const gloom = this.linkedRooms(site, 'gloomHall');
+    if (gloom.length) mul *= 1 - 0.1 * this.maxRank(gloom, 0);
+    return mul;
+  }
+
+  private startSegment(p: Party, next: number): void {
+    const e = this.edgeBetween(p.to, next);
+    p.from = p.to;
+    p.to = next;
+    p.d = 0;
+    p.len = e ? e.len : Math.hypot(this.site(next).x - this.site(p.from).x, this.site(next).y - this.site(p.from).y);
+  }
+
+  private tickParties(dt: number): void {
+    for (const p of [...this.parties]) {
+      if (!p.members.length) continue;
+      if (p.state === 'fight') continue;
+      if (p.state === 'bite') continue;
+      if (p.state === 'loot') {
+        p.lootT -= dt;
+        if (p.lootT <= 0) this.finishLoot(p);
+        continue;
       }
+      // At a site center with nowhere to go yet?
+      if (p.d >= p.len) {
+        const idx = p.route.indexOf(p.to);
+        const next = idx >= 0 ? p.route[idx + 1] : undefined;
+        if (next === undefined || !this.edgeBetween(p.to, next) || !this.dug.has(this.edgeBetween(p.to, next)!.id)) {
+          this.plan(p);
+          const i2 = p.route.indexOf(p.to);
+          const n2 = p.route[i2 + 1];
+          if (n2 === undefined) continue;
+          this.startSegment(p, n2);
+        } else this.startSegment(p, next);
+      }
+      const a = this.site(p.from);
+      const b = this.site(p.to);
+      p.d = Math.min(p.len, p.d + this.speedOf(p) * dt);
+      const t = p.len > 0 ? p.d / p.len : 1;
+      p.x = a.x + (b.x - a.x) * t;
+      p.y = a.y + (b.y - a.y) * t;
+      const inside = this.inRect(p.to, p.x, p.y) ? p.to : this.inRect(p.from, p.x, p.y) ? p.from : -1;
+      if (inside !== p.inside) {
+        p.inside = inside;
+        if (inside >= 0 && inside === p.to) this.onEnterRoom(p, inside);
+      }
+      if (p.d >= p.len) this.arrive(p);
     }
   }
 
-  /** Rogues scan around themselves for traps whenever they reach a new tile. */
-  private onEnter(h: Hero, t: number): void {
-    const def = HEROES[h.cls];
-    if (def.spotChance <= 0 || h.goal === 'flee') return;
-    const g = this.grid;
-    const party = this.parties.get(h.partyId);
-    if (!party) return;
-    for (const n of [t, ...g.neighbors8(t)]) {
-      const f = g.features[n];
-      if (!f || FEATURES[f.id].category !== 'trap') continue;
-      if (party.known.get(n) === f.id || h.spotRolled.includes(n)) continue;
-      h.spotRolled.push(n);
-      if (g.touches(n, 'gloom')) continue;
-      if (this.rng.chance(def.spotChance)) {
-        party.known.set(n, f.id);
-        party.version++;
-        this.events.push({ t: 'spotted', tile: n });
-      }
-    }
-  }
-
-  private arrive(h: Hero): void {
-    const g = this.grid;
-    const here = h.path.length ? h.path[h.path.length - 1] : h.tile;
-    if (here !== h.target) {
-      this.plan(h);
-      return;
-    }
-    if (h.goal === 'flee' && here === g.entrance) {
-      this.escape(h);
-      return;
-    }
-    if (h.goal === 'maw' && here === g.maw) {
-      h.state = 'bite';
-      return;
-    }
-    if (h.goal === 'loot') {
-      const f = g.features[here];
-      if (f?.id === 'hoard') {
-        h.state = 'loot';
-        h.lootT = BALANCE.lootSeconds;
+  /** The party just stepped into a room's rectangle. */
+  private onEnterRoom(p: Party, site: number): void {
+    const r = this.rooms.get(site);
+    if (!r) return;
+    const def = ROOMS[r.id];
+    if (def.kind !== 'trap') return;
+    const hidden = this.linkedRooms(site, 'gloomHall').length > 0;
+    // Rogues disarm traps they know about.
+    if (!hidden && p.known.get(site) === r.id && !p.disarmed.has(site) && p.members.some((h) => h.cls === 'rogue')) {
+      if (this.rng.chance(BALANCE.disarmChance)) {
+        p.disarmed.add(site);
+        this.events.push({ t: 'disarm', site });
         return;
       }
-      // A Mimic (or a Hoard that was torn down): nothing to loot.
-      h.looted.push(here);
-      h.lootsLeft--;
-      if (f?.id === 'mimic') {
-        const party = this.parties.get(h.partyId);
-        if (party && party.known.get(here) !== 'mimic') {
-          party.known.set(here, 'mimic');
-          party.version++;
-        }
+    }
+    if (p.disarmed.has(site)) return;
+    if (r.id === 'oilCellar') {
+      for (const h of p.members) {
+        if (h.oily <= 0) this.events.push({ t: 'status', heroId: h.id, status: 'oily' });
+        h.oily = BALANCE.oilySeconds + 4 * r.ranks[0];
       }
-      h.goal = 'maw';
-      this.plan(h);
+      this.events.push({ t: 'trap', site, room: r.id });
+    } else if (r.id === 'pitDrop') {
+      const gullet = this.linkedRooms(site, 'gullet').length > 0;
+      for (const h of [...p.members]) {
+        let chance = 0.2 + 0.1 * r.ranks[0];
+        if (h.oily > 0 || h.sticky > 0) chance += 0.15 * r.ranks[2];
+        if (!this.rng.chance(chance)) continue;
+        const eaten = gullet && !h.champion;
+        this.events.push({ t: 'fall', heroId: h.id, site, eaten });
+        this.events.push({ t: 'trap', site, room: r.id, heroId: h.id });
+        if (eaten) this.killHero(h, p, site);
+        else this.damageHero(h, p, 25 + 15 * r.ranks[1], { pierce: true });
+      }
+    } else {
+      // Spikes and flames start their timers as the party walks in.
+      r.trapT = Math.min(r.trapT, 0.4);
     }
   }
 
-  private finishLoot(h: Hero): void {
-    const steal = Math.max(0, Math.min(this.gold * BALANCE.lootStealFraction, BALANCE.lootStealCapBase + BALANCE.lootStealCapPerLevel * h.level));
-    this.gold -= steal;
-    h.loot += steal;
-    h.looted.push(h.target);
-    h.lootsLeft--;
-    this.events.push({ t: 'loot', x: h.x, y: h.y, amount: steal });
-    h.state = 'walk';
-    h.goal = 'maw';
-    this.plan(h);
-  }
+  /** The party reached the center of a site. */
+  private arrive(p: Party): void {
+    const site = p.to;
+    const r = this.rooms.get(site);
+    if (r && !(r.id === 'mimicVault' && p.known.get(site) !== 'mimicVault')) this.learn(p, site, r.id);
+    if (r?.id === 'mimicVault' && !p.known.has(site)) p.known.set(site, 'vault');
 
-  private tickBite(h: Hero): void {
-    if (h.atk > 0) return;
-    h.atk = h.cooldown;
-    h.lastAttackAt = this.time;
-    const dmg = h.dmg * BALANCE.biteDamageMul;
-    this.mawHp -= dmg;
-    this.mawLastHitAt = this.time;
-    const stolen = Math.max(0, this.gold * BALANCE.biteStealFraction);
-    this.gold -= stolen;
-    h.loot += stolen;
-    h.bites++;
-    this.events.push({ t: 'bite', amount: dmg, stolen });
-    if (h.bites >= BALANCE.bitesBeforeFlee) this.startFleeing(h);
-  }
-
-  private startFleeing(h: Hero): void {
-    h.goal = 'flee';
-    h.state = 'walk';
-    this.plan(h);
-  }
-
-  private escape(h: Hero): void {
-    h.state = 'escaped';
-    this.escaped++;
-    const party = this.parties.get(h.partyId);
-    let rumors = 0;
-    if (party) {
-      party.escaped++;
-      const until = this.time + BALANCE.rumorSeconds;
-      for (const [tile, feature] of party.known) {
-        if (FEATURES[feature].category !== 'trap' && feature !== 'mimic') continue;
-        this.rumors.set(tile, { feature, until });
-        rumors++;
+    // Rogues peek into neighboring rooms.
+    if (p.goal !== 'flee' && p.members.some((h) => h.cls === 'rogue')) {
+      for (const n of this.linked(site)) {
+        const nr = this.rooms.get(n);
+        if (!nr || p.known.has(n)) continue;
+        if (ROOMS[nr.id].kind === 'trap' && this.linkedRooms(n, 'gloomHall').length) continue;
+        if (this.rng.chance(BALANCE.peekChance)) {
+          p.known.set(n, nr.id === 'mimicVault' ? 'vault' : nr.id);
+          this.events.push({ t: 'spotted', site: n });
+        }
       }
+    }
+
+    if (site === this.cave.gate && p.goal === 'flee') {
+      for (const h of [...p.members]) this.escape(h, p);
+      return;
+    }
+    if (site === this.cave.maw && p.goal !== 'flee') {
+      p.state = 'bite';
+      return;
+    }
+    if (p.goal !== 'flee' && r && ROOMS[r.id].monster && this.standing(site).length) {
+      p.state = 'fight';
+      return;
+    }
+    if (p.goal === 'loot' && site === p.target) {
+      if (r?.id === 'vault') {
+        p.state = 'loot';
+        p.lootT = BALANCE.lootSeconds + 1.5 * r.ranks[1];
+        return;
+      }
+      p.looted.add(site);
+      p.goal = 'maw';
+    }
+    if (p.goal !== 'flee') this.considerSplit(p, site);
+    this.plan(p);
+  }
+
+  private learn(p: Party, site: number, id: RoomId): void {
+    if (p.known.get(site) !== id) p.known.set(site, id);
+  }
+
+  /** A greedy Rogue may sneak off alone to raid a Vault the party would skip. */
+  private considerSplit(p: Party, site: number): void {
+    if (p.members.length < 2 || p.goal === 'loot') return;
+    for (const h of [...p.members]) {
+      if (h.cls !== 'rogue' || h.champion || h.lootsLeft <= 0) continue;
+      const def = HEROES.rogue;
+      const best = this.bestVault(site, h.speed, def.fear, def.greed, p.known, p.looted);
+      if (!best || best[1] < BALANCE.rogueSplitScore) continue;
+      const solo = this.split(p, h);
+      solo.goal = 'loot';
+      solo.target = best[0];
+      this.events.push({ t: 'split', heroId: h.id, reason: 'loot' });
+      this.plan(solo);
+      return;
+    }
+  }
+
+  /** Move a hero out of its party into a party of its own at the same spot. */
+  private split(p: Party, h: Hero): Party {
+    p.members = p.members.filter((m) => m !== h);
+    const solo: Party = {
+      ...p,
+      id: this.nextId++,
+      members: [h],
+      known: new Map(p.known),
+      disarmed: new Set(p.disarmed),
+      looted: new Set(p.looted),
+      route: [...p.route],
+      state: 'move',
+    };
+    this.parties.push(solo);
+    return solo;
+  }
+
+  private finishLoot(p: Party): void {
+    const site = p.target;
+    const r = this.rooms.get(site);
+    for (const h of p.members) {
+      const steal = Math.max(0, Math.min(this.gold * BALANCE.lootStealFraction, BALANCE.lootStealCapBase + BALANCE.lootStealCapPerLevel * h.level));
+      this.gold -= steal;
+      h.loot += steal;
+      h.lootsLeft--;
+      this.events.push({ t: 'loot', site, heroId: h.id, amount: steal });
+      if (r?.id === 'vault' && r.ranks[2] > 0) {
+        h.cursed = 6;
+        h.cursedDps = 2 * r.ranks[2];
+        this.events.push({ t: 'status', heroId: h.id, status: 'cursed' });
+      }
+    }
+    p.looted.add(site);
+    p.state = 'move';
+    p.goal = 'maw';
+    // A Rogue with its loot heads home rather than pushing on.
+    if (p.members.length === 1 && p.members[0].cls === 'rogue') p.goal = 'flee';
+    this.plan(p);
+  }
+
+  private startFleeing(p: Party, h: Hero): void {
+    const solo = p.members.length > 1 ? this.split(p, h) : p;
+    solo.goal = 'flee';
+    if (solo.state === 'move' && solo.d < solo.len) {
+      // Turn around in the corridor.
+      const from = solo.from;
+      solo.from = solo.to;
+      solo.to = from;
+      solo.d = solo.len - solo.d;
+      solo.route = [solo.from, solo.to];
+    } else {
+      solo.state = 'move';
+      this.plan(solo);
+    }
+    if (solo !== p) this.events.push({ t: 'split', heroId: h.id, reason: 'flee' });
+  }
+
+  // ------------------------------------------------------------ heroes: status effects and healing
+
+  private partyOf(h: Hero): Party | undefined {
+    return this.parties.find((p) => p.members.includes(h));
+  }
+
+  private tickHeroes(dt: number): void {
+    for (const p of [...this.parties]) {
+      const room = p.inside >= 0 ? this.rooms.get(p.inside) : undefined;
+      for (const h of [...p.members]) {
+        if (h.dead) continue;
+        if (h.atk > 0) h.atk -= dt;
+        if (h.sticky > 0) h.sticky -= dt;
+        let dps = 0;
+        if (h.oily > 0) {
+          h.oily -= dt;
+          const fumes = this.maxRankOfType('oilCellar', 2);
+          if (fumes) dps += fumes;
+        }
+        if (h.burning > 0) {
+          h.burning -= dt;
+          dps += h.burnDps;
+        }
+        if (h.bleed > 0) {
+          h.bleed -= dt;
+          dps += h.bleedDps;
+        }
+        if (h.poison > 0) {
+          h.poison -= dt;
+          dps += h.poisonDps;
+        }
+        if (h.cursed > 0) {
+          h.cursed -= dt;
+          dps += h.cursedDps;
+        }
+        if (room?.id === 'gullet') dps += 3 * room.ranks[2];
+        if (room?.id === 'soulWell') dps += 2 * room.ranks[2];
+        if (dps > 0) {
+          h.dotAcc += dps * dt;
+          if (h.dotAcc >= 3) {
+            const amt = h.dotAcc;
+            h.dotAcc = 0;
+            this.damageHero(h, p, amt, { pierce: true, dot: true });
+            if (h.dead) continue;
+          }
+        }
+        const def = HEROES[h.cls];
+        if (def.heal) {
+          h.healT -= dt;
+          if (h.healT <= 0) {
+            h.healT = def.heal.interval;
+            let best: Hero | null = null;
+            for (const o of p.members) if (!o.dead && o.hp < o.maxHp && (!best || o.hp / o.maxHp < best.hp / best.maxHp)) best = o;
+            if (best) {
+              const amt = Math.min(best.maxHp - best.hp, def.heal.amount * heroDmgMul(h.level));
+              best.hp += amt;
+              this.events.push({ t: 'heal', heroId: best.id, amount: amt });
+            }
+          }
+        }
+        if (p.goal !== 'flee' && def.fleeAt > 0 && !h.champion && h.hp / h.maxHp < def.fleeAt) this.startFleeing(p, h);
+      }
+    }
+  }
+
+  private maxRankOfType(id: RoomId, track: number): number {
+    let m = 0;
+    for (const r of this.rooms.values()) if (r.id === id) m = Math.max(m, r.ranks[track]);
+    return m;
+  }
+
+  // ------------------------------------------------------------ combat
+
+  /** Monsters in a room that are on their feet. */
+  standing(site: number): Monster[] {
+    return this.monsters.filter((m) => m.site === site && m.hp > 0 && m.down <= 0);
+  }
+
+  private tickRooms(dt: number): void {
+    for (const r of this.rooms.values()) {
+      const def = ROOMS[r.id];
+      if (!def.monster) continue;
+      const mul = this.respawnMul(r);
+      r.slots.forEach((slot, s) => {
+        if (slot.monsterId !== null) return;
+        slot.respawn -= dt * mul;
+        if (slot.respawn <= 0) {
+          this.spawnMonster(r, s);
+          this.events.push({ t: 'respawn', site: r.site, kind: def.monster! });
+        }
+      });
+    }
+    for (const m of this.monsters) {
+      if (m.down > 0) {
+        m.down -= dt;
+        if (m.down <= 0) {
+          const r = this.rooms.get(m.site);
+          m.hp = m.maxHp * (0.5 + 0.15 * (r?.id === 'boneCrypt' ? r.ranks[2] : 0));
+          this.events.push({ t: 'monsterUp', id: m.id, site: m.site });
+        }
+      }
+    }
+  }
+
+  private tickCombat(dt: number): void {
+    // Heroes inside each monster room
+    const bySite = new Map<number, { p: Party; h: Hero }[]>();
+    for (const p of this.parties) {
+      if (p.inside < 0) continue;
+      const r = this.rooms.get(p.inside);
+      if (!r || !ROOMS[r.id].monster) continue;
+      // A party walking up to a disguised Mimic is not attacked until it reaches the chest.
+      if (r.id === 'mimicVault' && p.state !== 'fight' && p.d < p.len) continue;
+      let list = bySite.get(p.inside);
+      if (!list) bySite.set(p.inside, (list = []));
+      for (const h of p.members) if (!h.dead) list.push({ p, h });
+    }
+
+    for (const m of this.monsters) {
+      if (m.hp <= 0 || m.down > 0) continue;
+      const r = this.rooms.get(m.site);
+      if (!r) continue;
+      if (m.atk > 0) m.atk -= dt;
+      const targets = bySite.get(m.site) ?? [];
+      if (!targets.length) {
+        m.targetId = null;
+        if (m.kind === 'mimic') m.ambush = true;
+        const healing = this.linkedRooms(m.site, 'larder').length ? 3 : 0;
+        if (healing && m.hp < m.maxHp) m.hp = Math.min(m.maxHp, m.hp + healing * dt);
+        if (m.kind === 'troll') m.hp = Math.min(m.maxHp, m.hp + (4 + 3 * r.ranks[1]) * dt);
+        continue;
+      }
+      if (m.kind === 'troll') m.hp = Math.min(m.maxHp, m.hp + (4 + 3 * r.ranks[1]) * dt);
+      if (r.id === 'goblinWarren' && r.ranks[2] > 0) m.hp = Math.min(m.maxHp, m.hp + 2 * r.ranks[2] * dt);
+      if (m.atk > 0) continue;
+      m.atk = MONSTERS[m.kind].cooldown;
+      m.lastAttackAt = this.time;
+      // Knights draw attention.
+      const knights = targets.filter((t) => t.h.cls === 'knight' && !t.h.dead);
+      const pool = (knights.length ? knights : targets).filter((t) => !t.h.dead);
+      if (!pool.length) continue;
+      const first = pool[Math.floor(this.rng.next() * pool.length)];
+      const hits = m.kind === 'troll' ? [first, ...targets.filter((t) => t !== first && !t.h.dead).slice(0, 1 + r.ranks[2])] : [first];
+      let dmg = this.monsterDamage(m);
+      let crit = false;
+      if (m.kind === 'mimic' && m.ambush) {
+        dmg *= 3;
+        crit = true;
+        m.ambush = false;
+        this.events.push({ t: 'ambush', site: m.site });
+        for (const t of targets) t.p.known.set(m.site, 'mimicVault');
+        for (const t of targets) if (t.p.goal !== 'flee' && (t.p.state === 'move' || t.p.state === 'loot')) t.p.state = 'fight';
+      }
+      m.targetId = first.h.id;
+      for (const t of hits) {
+        this.damageHero(t.h, t.p, dmg, { crit });
+        if (t.h.dead) {
+          if (r.id === 'mimicVault' && r.ranks[2]) m.hp = Math.min(m.maxHp, m.hp + m.maxHp * 0.25 * r.ranks[2]);
+          continue;
+        }
+        if (m.kind === 'slime' || m.kind === 'spider') {
+          if (t.h.sticky <= 0) this.events.push({ t: 'status', heroId: t.h.id, status: 'sticky' });
+          t.h.sticky = BALANCE.stickySeconds + (r.id === 'slimePit' ? 4 * r.ranks[1] : 0);
+        }
+        if (r.id === 'slimePit' && r.ranks[2]) {
+          t.h.poison = 4;
+          t.h.poisonDps = Math.max(t.h.poisonDps, 2 * r.ranks[2]);
+        }
+        if (m.kind === 'spider') {
+          if (t.h.poison <= 0) this.events.push({ t: 'status', heroId: t.h.id, status: 'poison' });
+          t.h.poison = 4;
+          t.h.poisonDps = 2 + 2 * r.ranks[1];
+        }
+      }
+    }
+
+    // Heroes in a fight swing back.
+    for (const p of this.parties) {
+      if (p.state !== 'fight') continue;
+      const site = p.to;
+      const foes = this.standing(site);
+      if (!foes.length) {
+        p.state = 'move';
+        const r = this.rooms.get(site);
+        if (p.goal === 'loot' && site === p.target && r?.id === 'mimicVault') {
+          p.looted.add(site);
+          p.goal = 'maw';
+        }
+        this.considerSplit(p, site);
+        this.plan(p);
+        continue;
+      }
+      const dread = this.linkedRooms(site, 'gloomHall');
+      const dmgMul = 1 - 0.1 * this.maxRank(dread, 2);
+      for (const h of p.members) {
+        if (h.dead || h.atk > 0) continue;
+        h.atk = h.cooldown;
+        h.lastAttackAt = this.time;
+        const foe = foes.reduce((a, b) => (b.hp < a.hp ? b : a));
+        this.damageMonster(foe, h.dmg * dmgMul);
+      }
+    }
+  }
+
+  private damageMonster(m: Monster, amount: number): void {
+    const r = this.rooms.get(m.site);
+    if (r?.id === 'boneCrypt') amount = Math.max(1, amount - 1.5 * r.ranks[1]);
+    m.hp -= amount;
+    m.lastHitAt = this.time;
+    const s = this.site(m.site);
+    this.events.push({ t: 'damage', x: s.x, y: s.y, amount, on: 'monster', id: m.id, site: m.site });
+    if (m.hp > 0) return;
+    if (m.kind === 'skeleton' && !m.reassembled) {
+      m.reassembled = true;
+      m.hp = 0.0001;
+      m.down = 3;
+      this.events.push({ t: 'monsterDown', id: m.id, site: m.site });
+      return;
+    }
+    m.hp = 0;
+    if (r && r.slots[m.slot]?.monsterId === m.id) {
+      r.slots[m.slot].monsterId = null;
+      r.slots[m.slot].respawn = ROOMS[r.id].respawn ?? 10;
+    }
+    this.events.push({ t: 'monsterDied', id: m.id, site: m.site, kind: m.kind });
+  }
+
+  damageHero(h: Hero, p: Party | undefined, amount: number, opts: { pierce?: boolean; crit?: boolean; dot?: boolean } = {}): void {
+    if (h.dead) return;
+    const dmg = opts.pierce ? amount : Math.max(1, amount - h.armor);
+    h.hp -= dmg;
+    h.lastHitAt = this.time;
+    const party = p ?? this.partyOf(h);
+    this.events.push({ t: 'damage', x: party?.x ?? 0, y: party?.y ?? 0, amount: dmg, on: 'hero', id: h.id, site: party?.inside ?? -1, crit: opts.crit, dot: opts.dot });
+    if (h.hp <= 0) this.killHero(h, party, party?.inside ?? -1);
+  }
+
+  private killHero(h: Hero, p: Party | undefined, site: number): void {
+    if (h.dead) return;
+    h.dead = true;
+    h.hp = 0;
+    const def = HEROES[h.cls];
+    const champMul = h.champion ? BALANCE.championRewardMul : 1;
+    const gullets = site >= 0 ? [...(this.rooms.get(site)?.id === 'gullet' ? [this.rooms.get(site)!] : []), ...this.linkedRooms(site, 'gullet')] : [];
+    const bonus = gullets.length > 0;
+    const goldMul = bonus ? 1.5 + 0.15 * this.maxRank(gullets, 0) : 1;
+    const essMul = bonus ? 1.5 + 0.25 * this.maxRank(gullets, 1) : 1;
+    const reward = def.gold * heroRewardMul(h.level) * this.mods.rewardMul * goldMul * champMul;
+    let essence = (BALANCE.essenceBase + BALANCE.essencePerLevel * h.level) * this.mods.rewardMul * essMul * champMul;
+    if (site >= 0) {
+      const wells = this.linkedRooms(site, 'soulWell');
+      if (this.rooms.get(site)?.id === 'soulWell') wells.push(this.rooms.get(site)!);
+      for (const w of wells) essence += 2 + 2 * w.ranks[1];
+    }
+    const infamy = def.infamy * h.level * champMul;
+    this.gold += reward + h.loot;
+    this.essence += essence;
+    this.goldFromKills += reward;
+    this.essenceFromKills += essence;
+    this.infamy += infamy;
+    this.eaten++;
+    if (h.champion) this.champions++;
+    const g = this.groups.get(h.group);
+    if (g) g.died++;
+    this.events.push({ t: 'heroDied', id: h.id, x: p?.x ?? 0, y: p?.y ?? 0, site, gold: reward + h.loot, essence, infamy, cls: h.cls, champion: h.champion, bonus });
+  }
+
+  private escape(h: Hero, p: Party): void {
+    h.dead = true;
+    this.escaped++;
+    const g = this.groups.get(h.group);
+    if (g) g.escaped++;
+    const until = this.time + BALANCE.rumorSeconds;
+    let rumors = 0;
+    for (const [site, id] of p.known) {
+      const room = this.rooms.get(site);
+      if (!room) continue;
+      // Gloom can make survivors forget, and a good Mimic stays secret.
+      const gloom = this.linkedRooms(site, 'gloomHall');
+      if (gloom.length && this.rng.chance(0.33 * this.maxRank(gloom, 1))) continue;
+      let report = id;
+      if (id === 'mimicVault' && room.id === 'mimicVault' && this.rng.chance(0.33 * room.ranks[1])) report = 'vault';
+      if (report === 'vault' && room.id === 'vault') continue;
+      if (ROOMS[report].kind === 'support' || ROOMS[report].kind === 'economy') continue;
+      this.rumors.set(site, { room: report, until });
+      rumors++;
     }
     this.events.push({ t: 'escaped', cls: h.cls, loot: h.loot, rumors });
   }
 
-  damageHero(h: Hero, amount: number, opts: { pierce?: boolean; burn?: boolean; crit?: boolean } = {}): void {
-    if (h.state === 'dead' || h.state === 'escaped') return;
-    const dmg = opts.pierce ? amount : Math.max(1, amount - h.armor);
-    h.hp -= dmg;
-    h.lastHitAt = this.time;
-    this.events.push({ t: 'damage', x: h.x, y: h.y, amount: dmg, on: 'hero', id: h.id, crit: opts.crit, burn: opts.burn });
-    if (h.hp <= 0) this.killHero(h);
-  }
-
-  private killHero(h: Hero): void {
-    h.state = 'dead';
-    h.hp = 0;
-    const def = HEROES[h.cls];
-    const g = this.grid;
-    const tile = g.tileAt(h.x, h.y);
-    const gullet = tile >= 0 && (g.features[tile]?.id === 'gullet' || g.touches(tile, 'gullet'));
-    const champMul = h.champion ? BALANCE.championRewardMul : 1;
-    const reward = def.gold * heroRewardMul(h.level) * this.mods.goldMul * (gullet ? 1.5 : 1) * champMul;
-    const gold = reward + h.loot;
-    const infamy = def.infamy * h.level * champMul;
-    this.gold += gold;
-    this.goldFromKills += reward;
-    this.infamy += infamy;
-    this.eaten++;
-    if (h.champion) this.champions++;
-    const party = this.parties.get(h.partyId);
-    if (party) party.died++;
-    this.events.push({ t: 'heroDied', x: h.x, y: h.y, gold, infamy, cls: h.cls, champion: h.champion, gullet });
-  }
-
-  // ------------------------------------------------------------ monsters
-
-  private damageMonster(m: Monster, amount: number): void {
-    m.hp -= amount;
-    m.lastHitAt = this.time;
-    this.events.push({ t: 'damage', x: m.x, y: m.y, amount, on: 'monster', id: m.id });
-    if (m.hp > 0) return;
-    const f = this.grid.features[m.lair];
-    if (f && f.slots[m.slot]?.monsterId === m.id) {
-      f.slots[m.slot].monsterId = null;
-      f.slots[m.slot].respawn = FEATURES[f.id].respawn ?? 10;
-    }
-    this.events.push({ t: 'monsterDied', x: m.x, y: m.y, kind: m.kind });
-  }
-
-  private tickMonsters(dt: number): void {
-    const g = this.grid;
-    for (const m of this.monsters) {
-      if (m.hp <= 0) continue;
-      const def = MONSTERS[m.kind];
-      if (m.atk > 0) m.atk -= dt;
-      const area = this.leashArea(m.lair, m.kind);
-
-      // Pick a target: Knights draw attention, otherwise the nearest hero in range.
-      let target: Hero | null = null;
-      let bestScore = Infinity;
-      for (const h of this.heroes) {
-        if (h.state === 'dead' || h.state === 'escaped') continue;
-        if (m.kind === 'mimic') {
-          if (Math.hypot(h.x - m.x, h.y - m.y) > 0.9) continue;
-        } else if (!area.has(g.tileAt(h.x, h.y))) continue;
-        let score = Math.hypot(h.x - m.x, h.y - m.y);
-        if (h.cls === 'knight') score -= 1.5;
-        if (score < bestScore) {
-          bestScore = score;
-          target = h;
-        }
-      }
-
-      if (!target) {
-        m.targetId = null;
-        m.idleT += dt;
-        if (m.kind === 'mimic' && m.idleT > 4) m.ambush = true;
-        this.moveMonster(m, m.homeX, m.homeY, dt);
-        if (g.touches(m.lair, 'larder') && m.hp < m.maxHp) m.hp = Math.min(m.maxHp, m.hp + 3 * dt);
-        continue;
-      }
-
-      m.idleT = 0;
-      m.targetId = target.id;
-      const d = Math.hypot(target.x - m.x, target.y - m.y);
-      m.facing = this.faceToward(m.x, m.y, target.x, target.y, m.facing);
-      if (d > BALANCE.monsterReach && def.speed > 0) {
-        // Approach from a slightly different angle per monster so groups fan out.
-        const ang = m.id * 2.399;
-        this.moveMonster(m, target.x + Math.cos(ang) * 0.3, target.y + Math.sin(ang) * 0.3, dt, area);
-      }
-      const reach = def.speed > 0 ? BALANCE.monsterReach + 0.05 : 0.9;
-      if (d <= reach && m.atk <= 0) {
-        m.atk = m.cooldown;
-        m.lastAttackAt = this.time;
-        let dmg = m.dmg;
-        if (m.ambush && def.ambushMul) {
-          dmg *= def.ambushMul;
-          m.ambush = false;
-          this.events.push({ t: 'ambush', tile: m.lair });
-          const party = this.parties.get(target.partyId);
-          if (party && party.known.get(m.lair) !== 'mimic') {
-            party.known.set(m.lair, 'mimic');
-            party.version++;
-          }
-        }
-        this.damageHero(target, dmg, { crit: dmg > m.dmg });
-        if (def.sticky && target.state !== 'dead') {
-          if (target.sticky <= 0) this.events.push({ t: 'status', x: target.x, y: target.y, status: 'sticky' });
-          target.sticky = BALANCE.stickySeconds;
-        }
-      }
-    }
-  }
-
-  /** Step toward a point, staying on walkable tiles inside the leash area. */
-  private moveMonster(m: Monster, tx: number, ty: number, dt: number, area?: Set<number>): void {
-    if (m.speed <= 0) return;
-    const g = this.grid;
-    const dx = tx - m.x;
-    const dy = ty - m.y;
-    const d = Math.hypot(dx, dy);
-    if (d < 0.02) return;
-    const step = Math.min(d, m.speed * dt);
-    const nx = m.x + (dx / d) * step;
-    const ny = m.y + (dy / d) * step;
-    const ok = (x: number, y: number) => {
-      const t = g.tileAt(x, y);
-      return t >= 0 && g.isWalkable(t) && (!area || area.has(t));
-    };
-    if (ok(nx, ny)) {
-      m.x = nx;
-      m.y = ny;
-    } else if (ok(nx, m.y)) {
-      m.x = nx;
-    } else if (ok(m.x, ny)) {
-      m.y = ny;
-    }
-  }
-
   // ------------------------------------------------------------ traps
 
-  private tickTraps(): void {
-    const g = this.grid;
-    for (const t of g.featureTiles()) {
-      const f = g.features[t]!;
-      const def = FEATURES[f.id];
-      if (def.category !== 'trap' || f.rearm > 0) continue;
-
-      if (f.id === 'fireVent') {
-        const trigger = this.heroes.some((h) => this.isActive(h) && g.chebyshev(g.tileAt(h.x, h.y), t) <= 1);
-        if (!trigger) continue;
-        f.rearm = def.rearm!;
-        this.events.push({ t: 'trap', tile: t, feature: f.id });
-        const cx = g.x(t);
-        const cy = g.y(t);
-        for (const h of this.heroes) {
-          if (!this.isActive(h) || Math.hypot(h.x - cx, h.y - cy) > 1.5) continue;
-          this.learn(h, t, f.id);
-          if (h.oily > 0) {
-            h.oily = 0;
-            h.burning = BALANCE.burnSeconds;
-            h.burnDps = 7 * trapDmgMul(f.level);
-            this.events.push({ t: 'ignite', x: h.x, y: h.y });
-          }
-          this.damageHero(h, def.damage! * trapDmgMul(f.level));
-        }
+  private tickTraps(dt: number): void {
+    for (const r of this.rooms.values()) {
+      if (r.id !== 'spikeHall' && r.id !== 'flameGallery') continue;
+      const inside = this.parties.filter((p) => p.inside === r.site && !p.disarmed.has(r.site) && p.members.length);
+      if (!inside.length) {
+        r.trapT = 0.5;
         continue;
       }
-
-      // Spikes and oil hit someone standing on the tile.
-      const victim = this.heroes.find((h) => this.isActive(h) && g.tileAt(h.x, h.y) === t);
-      if (!victim) continue;
-      const party = this.parties.get(victim.partyId);
-      const def2 = HEROES[victim.cls];
-      if (def2.disarmChance > 0 && party?.known.get(t) === f.id && !victim.disarmTried.includes(t) && !g.touches(t, 'gloom')) {
-        victim.disarmTried.push(t);
-        if (this.rng.chance(def2.disarmChance)) {
-          f.rearm = def.rearm! * 2;
-          this.events.push({ t: 'disarm', tile: t });
-          continue;
+      r.trapT -= dt;
+      if (r.trapT > 0) continue;
+      if (r.id === 'spikeHall') {
+        r.trapT = 1.5 * (1 - 0.2 * r.ranks[1]);
+        const p = inside[Math.floor(this.rng.next() * inside.length)];
+        const alive = p.members.filter((h) => !h.dead);
+        const h = alive[Math.floor(this.rng.next() * alive.length)];
+        if (!h) continue;
+        const crit = h.sticky > 0;
+        const dmg = 14 * (1 + 0.4 * r.ranks[0]) * (crit ? 2 : 1);
+        this.events.push({ t: 'trap', site: r.site, room: r.id, heroId: h.id, crit });
+        this.learnAll(inside, r.site, r.id);
+        this.damageHero(h, p, dmg, { crit });
+        if (!h.dead && r.ranks[2]) {
+          h.bleed = 4;
+          h.bleedDps = r.ranks[2] + 1;
         }
-      }
-      f.rearm = def.rearm!;
-      this.learn(victim, t, f.id);
-      if (f.id === 'spikes') {
-        const crit = victim.sticky > 0;
-        this.events.push({ t: 'trap', tile: t, feature: f.id, crit });
-        this.damageHero(victim, def.damage! * trapDmgMul(f.level) * (crit ? 2 : 1), { crit });
-      } else if (f.id === 'oil') {
-        this.events.push({ t: 'trap', tile: t, feature: f.id });
-        if (victim.oily <= 0) this.events.push({ t: 'status', x: victim.x, y: victim.y, status: 'oily' });
-        victim.oily = BALANCE.oilySeconds;
+      } else {
+        r.trapT = 2.2 * (1 - 0.18 * r.ranks[1]);
+        this.events.push({ t: 'trap', site: r.site, room: r.id });
+        this.learnAll(inside, r.site, r.id);
+        for (const p of inside) {
+          for (const h of [...p.members]) {
+            if (h.dead) continue;
+            if (h.oily > 0) {
+              h.oily = 0;
+              h.burning = BALANCE.burnSeconds + 2 * r.ranks[2];
+              h.burnDps = BALANCE.burnDps * (1 + 0.2 * r.ranks[2]);
+              this.events.push({ t: 'ignite', heroId: h.id });
+            }
+            this.damageHero(h, p, 9 * (1 + 0.35 * r.ranks[0]));
+          }
+        }
       }
     }
   }
 
-  private isActive(h: Hero): boolean {
-    return h.state !== 'dead' && h.state !== 'escaped';
-  }
-
-  private learn(h: Hero, tile: number, id: FeatureId): void {
-    const party = this.parties.get(h.partyId);
-    if (!party || party.known.get(tile) === id) return;
-    party.known.set(tile, id);
-    party.version++;
+  private learnAll(parties: Party[], site: number, id: RoomId): void {
+    for (const p of parties) this.learn(p, site, id);
   }
 
   // ------------------------------------------------------------ the Maw
 
   private tickMaw(dt: number): void {
-    const g = this.grid;
-    const mx = g.x(g.maw);
-    const my = g.y(g.maw);
+    const maw = this.cave.maw;
     if (this.mawChompT > 0) this.mawChompT -= dt;
     let biting = false;
-    let target: Hero | null = null;
-    let bestD = Infinity;
-    for (const h of this.heroes) {
-      if (!this.isActive(h)) continue;
-      if (h.state === 'bite') biting = true;
-      const d = Math.hypot(h.x - mx, h.y - my) - (h.state === 'bite' ? 1 : 0);
-      if (d <= BALANCE.mawChompRange && d < bestD) {
-        bestD = d;
-        target = h;
+    let target: { p: Party; h: Hero } | null = null;
+    for (const p of this.parties) {
+      if (p.inside !== maw) continue;
+      for (const h of p.members) {
+        if (h.dead) continue;
+        if (p.state === 'bite') {
+          biting = true;
+          if (h.atk <= 0) {
+            h.atk = h.cooldown;
+            h.lastAttackAt = this.time;
+            const dmg = h.dmg * BALANCE.biteDamageMul;
+            this.mawHp -= dmg;
+            this.mawLastHitAt = this.time;
+            const stolen = Math.max(0, this.gold * BALANCE.biteStealFraction);
+            this.gold -= stolen;
+            h.loot += stolen;
+            h.bites++;
+            this.events.push({ t: 'bite', heroId: h.id, amount: dmg, stolen });
+          }
+        }
+        if (!target || (p.state === 'bite' && target.p.state !== 'bite')) target = { p, h };
       }
     }
     if (target && this.mawChompT <= 0) {
       this.mawChompT = BALANCE.mawChompCooldown;
       this.mawLastChompAt = this.time;
-      this.events.push({ t: 'chomp', heroId: target.id });
-      this.damageHero(target, this.mawChompDamage, { pierce: true });
+      this.events.push({ t: 'chomp', heroId: target.h.id });
+      this.damageHero(target.h, target.p, this.mawChompDamage, { pierce: true });
+    }
+    // Heroes who have bitten their fill run home.
+    for (const p of [...this.parties]) {
+      if (p.state !== 'bite') continue;
+      for (const h of [...p.members]) if (!h.dead && h.bites >= BALANCE.bitesBeforeFlee) this.startFleeing(p, h);
     }
     if (!biting && this.mawHp < this.mawMaxHp) this.mawHp = Math.min(this.mawMaxHp, this.mawHp + BALANCE.mawRegen * dt);
   }
@@ -1254,19 +1544,18 @@ export class Sim {
   // ------------------------------------------------------------ bookkeeping
 
   private cleanup(): void {
-    this.heroes = this.heroes.filter((h) => h.state !== 'dead' && h.state !== 'escaped');
-    this.monsters = this.monsters.filter((m) => m.hp > 0);
-    for (const p of this.parties.values()) {
-      if (p.done || p.died + p.escaped < p.size) continue;
-      p.done = true;
-      if (p.escaped === 0) {
-        const bonus = BALANCE.partyWipeInfamyPerHero * p.size;
+    for (const p of this.parties) p.members = p.members.filter((h) => !h.dead);
+    this.parties = this.parties.filter((p) => p.members.length > 0);
+    this.monsters = this.monsters.filter((m) => m.hp > 0 || m.down > 0);
+    for (const [id, g] of this.groups) {
+      if (g.done || g.died + g.escaped < g.size) continue;
+      g.done = true;
+      if (g.escaped === 0) {
+        const bonus = BALANCE.partyWipeInfamyPerHero * g.size;
         this.infamy += bonus;
-        this.events.push({ t: 'wipe', size: p.size, infamy: bonus });
+        this.events.push({ t: 'wipe', size: g.size, infamy: bonus });
       }
-    }
-    if (this.parties.size > 50) {
-      for (const [id, p] of this.parties) if (p.done) this.parties.delete(id);
+      if (this.groups.size > 60) this.groups.delete(id);
     }
   }
 
@@ -1274,82 +1563,45 @@ export class Sim {
     this.rumorCheckT -= dt;
     if (this.rumorCheckT > 0) return;
     this.rumorCheckT = 1;
-    for (const [tile, r] of this.rumors) if (r.until <= this.time) this.rumors.delete(tile);
+    for (const [site, r] of this.rumors) if (r.until <= this.time) this.rumors.delete(site);
   }
 
-  private checkUnlocks(): void {
-    for (const f of FEATURE_ORDER) {
-      if (this.unlocked.has(f) || this.infamy < FEATURES[f].unlockInfamy) continue;
-      this.unlocked.add(f);
-      this.events.push({ t: 'unlock', feature: f });
+  private checkUnlocks(silent: boolean): void {
+    while (this.tier + 1 < BALANCE.tierInfamy.length && this.infamy >= BALANCE.tierInfamy[this.tier + 1]) {
+      this.tier++;
+      if (!silent) this.events.push({ t: 'unlock', tier: this.tier });
     }
   }
 
-  // ------------------------------------------------------------ queries for the UI
-
-  /**
-   * The route a fresh hero of this class would take right now, using only what the
-   * town has heard. Includes a Hoard detour when the class would make one.
-   */
-  previewRoute(cls: HeroClass): number[] {
-    this.refreshCaches();
-    const g = this.grid;
-    const known = new Map<number, FeatureId>();
-    for (const [tile, r] of this.rumors) known.set(tile, r.feature);
-    const def = HEROES[cls];
-    const cost = this.makeCostFn(def.fear, known, g);
-    const field = dijkstra(g, g.entrance, cost);
-    const fromMaw = dijkstra(g, g.maw, cost);
-    const direct = field.dist[g.maw];
-    let best = 0;
-    let target = g.maw;
-    for (const c of this.lootCandidates(known)) {
-      if (!Number.isFinite(field.dist[c])) continue;
-      const score = def.greed * BALANCE.hoardAppeal - (field.dist[c] + fromMaw.dist[c] - direct) * BALANCE.detourWeight;
-      if (score > best) {
-        best = score;
-        target = c;
-      }
-    }
-    const first = pathTo(field, target) ?? [];
-    if (target === g.maw) return [g.entrance, ...first];
-    const second = pathTo(dijkstra(g, target, cost), g.maw) ?? [];
-    return [g.entrance, ...first, ...second];
-  }
-
-  /** Infamy -> danger readout for the HUD. */
-  threatLabel(): string {
-    const lvl = this.partyLevel();
-    const size = this.partySize();
-    return `Lv ${lvl.toFixed(1)} · ~${Math.max(1, Math.round(size))} heroes`;
+  /** Rooms unlocked at a tier, for the HUD. */
+  roomsInTier(tier: number): RoomId[] {
+    return ROOM_ORDER.filter((id) => ROOMS[id].tier === tier && this.isUnlocked(id));
   }
 
   toSave(): RunSave {
-    const g = this.grid;
     return {
+      v: 2,
       seed: this.seed,
       rng: this.rng.state,
       time: this.time,
       gold: this.gold,
+      essence: this.essence,
       infamy: this.infamy,
       eaten: this.eaten,
       escaped: this.escaped,
       champions: this.champions,
       goldFromKills: this.goldFromKills,
+      essenceFromKills: this.essenceFromKills,
       mawHp: this.mawHp,
       mawLevel: this.mawLevel,
-      kinds: g.encodeKinds(),
-      features: g.featureTiles().map((i) => {
-        const f = g.features[i]!;
-        return { i, id: f.id, level: f.level, invested: f.invested };
-      }),
-      rumors: [...this.rumors].map(([i, r]) => ({ i, feature: r.feature, until: r.until })),
+      rooms: [...this.rooms.values()].map((r) => ({ site: r.site, id: r.id, ranks: [...r.ranks] as [number, number, number], invested: { ...r.invested } })),
+      dug: [...this.dug],
+      excavated: [...this.excavated],
+      rumors: [...this.rumors].map(([site, r]) => ({ site, room: r.room, until: r.until })),
       nextPartyIn: this.nextPartyIn,
       nextChampionAt: this.nextChampionAt,
       partyCount: this.partyCount,
-      unlocked: [...this.unlocked],
+      tier: this.tier,
     };
   }
 }
-
-export type { DistanceField };

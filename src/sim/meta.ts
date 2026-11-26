@@ -1,4 +1,4 @@
-import { UPGRADES, type UpgradeId } from './content';
+import { UPGRADES, type RoomId, type UpgradeId } from './content';
 
 /** Progress that survives dungeon collapses. */
 export interface MetaState {
@@ -39,22 +39,26 @@ export interface MetaMods {
   mawHpMul: number;
   chompMul: number;
   costMul: number;
-  goldMul: number;
+  rewardMul: number;
   teethMul: number;
   escalationMul: number;
   headStart: boolean;
+  blueprints: Set<RoomId>;
 }
 
 export function metaMods(meta: MetaState): MetaMods {
   const l = (id: UpgradeId) => upgradeLevel(meta, id);
+  const blueprints = new Set<RoomId>();
+  for (const def of Object.values(UPGRADES)) if (def.blueprint && l(def.id) > 0) blueprints.add(def.blueprint);
   return {
     startGold: 100 * l('deepPockets'),
     mawHpMul: 1 + 0.3 * l('thickHide'),
     chompMul: 1 + 0.4 * l('sharpFangs'),
     costMul: 1 - 0.1 * l('haggler'),
-    goldMul: 1 + 0.2 * l('gourmand'),
+    rewardMul: 1 + 0.2 * l('gourmand'),
     teethMul: 1 + 0.25 * l('dreadful'),
     escalationMul: 1 - 0.1 * l('lowProfile'),
     headStart: l('headStart') > 0,
+    blueprints,
   };
 }

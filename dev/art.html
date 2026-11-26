@@ -5,12 +5,12 @@
 <body>
 <canvas id="sheet"></canvas>
 <script type="module">
-import { buildBank, featureIcon } from '../src/game/art/bank.ts';
-import { TILE_W, TILE_H, BLOCK_H } from '../src/game/art/canvas.ts';
+import { buildBank } from '../src/game/art/bank.ts';
+import { roomPreview, ROOM_LOOK } from '../src/game/art/topdown.ts';
 const bank = buildBank();
-const S = 4;
+const S = 3;
 const c = document.getElementById('sheet');
-c.width = 1400; c.height = 1500;
+c.width = 1500; c.height = 2000;
 const ctx = c.getContext('2d');
 ctx.imageSmoothingEnabled = false;
 ctx.fillStyle = '#120d16'; ctx.fillRect(0,0,c.width,c.height);
@@ -23,51 +23,14 @@ for (const [name, img] of bank) {
   ctx.fillStyle = '#aaa'; ctx.fillText(name, x, y + h + 11);
   x += Math.max(w, ctx.measureText(name).width) + 12; rowH = Math.max(rowH, h);
 }
-// Mini iso scene
-y += rowH + 40;
-const ox = 500, oy = y;
-const Z = 3;
-const map = [
- 'rrrrrrrr',
- 'rffffffr',
- 'rfrrrrfr',
- 'rfbrrrfr',
- 'efffffmr',
- 'rrrrrrrr',
-];
-const items = [];
-for (let gy = 0; gy < map.length; gy++) for (let gx = 0; gx < map[0].length; gx++) {
-  const k = map[gy][gx];
-  const sx = ox + (gx - gy) * TILE_W/2 * Z, sy = oy + (gx + gy) * TILE_H/2 * Z;
-  items.push({ d: gx+gy, k, sx, sy, gx, gy });
-}
-items.sort((a,b)=>a.d-b.d);
-for (const it of items) {
-  const draw = (img, ax, ay) => ctx.drawImage(img, it.sx - ax*Z, it.sy - ay*Z, img.width*Z, img.height*Z);
-  if (it.k === 'r') draw(bank.get('rock:'+((it.gx+it.gy)%3)), 16, 8 + BLOCK_H);
-  else if (it.k === 'b') draw(bank.get('bedrock:0'), 16, 8 + BLOCK_H);
-  else {
-    draw(bank.get('floor:'+((it.gx*3+it.gy)%4)), 16, 8);
-    if (it.k === 'e') draw(bank.get('entrance:0'), 17, 40);
-    if (it.k === 'm') draw(bank.get('maw:1'), 26, 32);
-    if (it.gx === 2 && it.gy === 1) draw(bank.get('spikes:1'), 16, 16);
-    if (it.gx === 4 && it.gy === 1) draw(bank.get('goblinDen'), 9, 14);
-    if (it.gx === 6 && it.gy === 2) draw(bank.get('oil'), 16, 8);
-    if (it.gx === 6 && it.gy === 3) draw(bank.get('fireVent'), 16, 8);
-    if (it.gx === 3 && it.gy === 4) draw(bank.get('gullet'), 16, 8);
-    if (it.gx === 1 && it.gy === 2) draw(bank.get('hoard'), 9, 10);
-    if (it.gx === 1 && it.gy === 3) draw(bank.get('gloom:0'), 16, 8);
-    if (it.gx === 5 && it.gy === 4) draw(bank.get('larder'), 9, 11);
-    if (it.gx === 2 && it.gy === 4) { draw(bank.get('shadow'), 7, 3); draw(bank.get('knight:0'), 6, 15); }
-    if (it.gx === 4 && it.gy === 4) { draw(bank.get('shadow'), 7, 3); draw(bank.get('cleric:1'), 6, 15); }
-    if (it.gx === 3 && it.gy === 1) { draw(bank.get('shadow'), 7, 3); draw(bank.get('goblin:0'), 6, 11); }
-    if (it.gx === 5 && it.gy === 1) { draw(bank.get('shadow'), 7, 3); draw(bank.get('rogue:0'), 6, 15); }
-  }
-}
-let ix = 10;
-for (const n of ['goblinDen','spikes:1','hoard','slimePit','larder','oil','gloom:0','fireVent','gullet','mimicBait']) {
-  const ic = featureIcon(bank, n);
-  ctx.drawImage(ic, ix, oy + 330, ic.width*3, ic.height*3); ix += ic.width*3 + 8;
+y += rowH + 30; x = 10; rowH = 0;
+for (const look of Object.keys(ROOM_LOOK)) {
+  const img = roomPreview(bank, look);
+  const w = img.width * 2, h = img.height * 2;
+  if (x + w > c.width - 10) { x = 10; y += rowH + 18; rowH = 0; }
+  ctx.drawImage(img, x, y, w, h);
+  ctx.fillStyle = '#aaa'; ctx.fillText(look, x, y + h + 11);
+  x += w + 12; rowH = Math.max(rowH, h);
 }
 document.title = 'ready';
 </script>

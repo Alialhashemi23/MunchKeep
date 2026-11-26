@@ -1,6 +1,6 @@
 import type { Audio } from '../audio/audio';
 import { Bot } from '../sim/bot';
-import { BALANCE, FEATURES, HEROES, teethForRun, type FeatureId } from '../sim/content';
+import { BALANCE, HEROES, ROOMS, ROOM_ORDER, teethForRun, type RoomId } from '../sim/content';
 import {
   applyOffline,
   newSaveFile,
@@ -14,12 +14,13 @@ import {
 } from '../sim/save';
 import { Sim, type ActionResult, type SimEvent } from '../sim/sim';
 
-export type Tool = 'inspect' | 'dig' | 'fill' | 'demolish' | FeatureId;
 export type Mode = 'title' | 'play' | 'collapsed';
 export type Selection =
-  | { kind: 'tile'; tile: number }
+  | { kind: 'room'; site: number }
+  | { kind: 'empty'; site: number }
   | { kind: 'hero'; id: number }
   | { kind: 'monster'; id: number }
+  | { kind: 'corridor'; edge: number }
   | { kind: 'maw' }
   | null;
 
@@ -42,30 +43,36 @@ export interface RunResult {
   voluntary: boolean;
 }
 
+/** What the pointer is over, for the cursor tooltip. */
+export interface Hover {
+  text: string;
+  bad: boolean;
+  sx: number;
+  sy: number;
+}
+
 const COLLAPSE_SCREEN_DELAY = 2800;
 
 /**
- * The game's conductor: owns the current Sim, the save file and the player's
- * current tool and speed. The renderer and the HUD both read from it.
+ * The game's conductor: owns the current Sim, the save file, the selection and the speed.
+ * The renderer and the HUD both read from it.
  */
 export class Keeper {
   save: SaveFile;
   sim: Sim;
   mode: Mode = 'title';
   speed = 1;
-  tool: Tool = 'inspect';
   selection: Selection = null;
+  /** Screen position of the click that opened the catalog. */
+  catalogAt: { sx: number; sy: number } | null = null;
   log: LogLine[] = [];
-  /** Events produced since the renderer last drained them. */
   frameEvents: SimEvent[] = [];
-  /** Interpolation factor between the last two sim ticks. */
   alpha = 0;
   offlineReport: OfflineGains | null = null;
   result: RunResult | null = null;
   collapseAt: number | null = null;
   toast: { text: string; tone: Tone; at: number } | null = null;
-  /** The tile under the cursor and whether the current tool would work there. */
-  hover: { tile: number; ok: boolean; reason: string; sx: number; sy: number } | null = null;
+  hover: Hover | null = null;
 
   private attract: Bot | null = null;
   private acc = 0;
@@ -73,6 +80,7 @@ export class Keeper {
   private autosaveMs = 0;
   private logId = 0;
   private lastAlarm = -99;
+  private lastSpeed = 1;
   private listeners = new Set<() => void>();
   private pausedBeforeHidden: number | null = null;
 
@@ -84,7 +92,6 @@ export class Keeper {
     const fromHot = hotSave ? parseSave(hotSave) : null;
     this.save = fromHot ?? readStore(store) ?? newSaveFile();
     this.audio.setVolumes(this.save.settings.sfx, this.save.settings.music);
-
     const run = this.save.run;
     if (run) {
       const elapsed = (Date.now() - this.save.savedAt) / 1000;
@@ -100,13 +107,12 @@ export class Keeper {
     } else {
       this.sim = this.makeAttract();
     }
+    if (this.save.migratedTeeth !== undefined) writeStore(store, this.save);
   }
 
   get hasRun(): boolean {
     return this.save.run !== null;
   }
-
-  // ------------------------------------------------------------ change notification
 
   onChange(fn: () => void): () => void {
     this.listeners.add(fn);
@@ -122,8 +128,7 @@ export class Keeper {
   private makeAttract(): Sim {
     const sim = new Sim(this.save.meta, 1234 + (this.save.meta.runs % 5));
     this.attract = new Bot(sim, 'good');
-    // Fast-forward a few minutes so the title backdrop already looks lived in.
-    for (let k = 0; k < (5 * 60) / BALANCE.dt; k++) {
+    for (let k = 0; k < (6 * 60) / BALANCE.dt; k++) {
       this.attract.update(BALANCE.dt);
       sim.tick();
     }
@@ -138,14 +143,14 @@ export class Keeper {
     this.sim = new Sim(this.save.meta, seed);
     this.mode = 'play';
     this.speed = 1;
-    this.tool = 'inspect';
     this.selection = null;
+    this.catalogAt = null;
     this.log = [];
     this.result = null;
     this.collapseAt = null;
     this.offlineReport = null;
     this.frameEvents = [];
-    this.addLog('You wake up hungry. Dig, build, and wait for dinner.', 'info');
+    this.addLog('You wake up hungry. Build rooms along the tunnel and wait for dinner.', 'info');
     this.persist();
     this.notify();
   }
@@ -155,7 +160,6 @@ export class Keeper {
     this.attract = null;
     this.mode = 'play';
     this.speed = 1;
-    this.tool = 'inspect';
     this.frameEvents = [];
     this.addLog('Welcome back. The Maw missed you.', 'info');
     this.notify();
@@ -170,7 +174,6 @@ export class Keeper {
     this.notify();
   }
 
-  /** Give up on this dungeon now and collect its Teeth. */
   collapseNow(): void {
     if (this.mode !== 'play' || this.sim.collapsed) return;
     this.sim.forceCollapse();
@@ -187,22 +190,13 @@ export class Keeper {
     meta.bestInfamy = Math.max(meta.bestInfamy, sim.infamy);
     meta.bestSeconds = Math.max(meta.bestSeconds, sim.time);
     meta.totalEaten += sim.eaten;
-    this.result = {
-      minutes: sim.minutes,
-      eaten: sim.eaten,
-      escaped: sim.escaped,
-      infamy: sim.infamy,
-      champions: sim.champions,
-      teeth,
-      newBest,
-      voluntary,
-    };
+    this.result = { minutes: sim.minutes, eaten: sim.eaten, escaped: sim.escaped, infamy: sim.infamy, champions: sim.champions, teeth, newBest, voluntary };
     this.save.run = null;
     this.collapseAt = performance.now();
+    this.selection = null;
     writeStore(this.store, this.save);
   }
 
-  /** Called by the UI once the collapse animation has played. */
   get collapseScreenDue(): boolean {
     return this.collapseAt !== null && this.mode === 'play' && performance.now() - this.collapseAt > COLLAPSE_SCREEN_DELAY;
   }
@@ -219,7 +213,6 @@ export class Keeper {
     writeStore(this.store, this.save);
   }
 
-  /** Save data for the artifact viewer's hot-reload snapshot. */
   snapshot(): string {
     if (this.mode === 'play' && !this.sim.collapsed && !this.attract) this.save.run = this.sim.toSave();
     this.save.savedAt = Date.now();
@@ -247,6 +240,11 @@ export class Keeper {
 
   resetEverything(): void {
     this.loadSave(newSaveFile());
+  }
+
+  clearMigrationNote(): void {
+    delete this.save.migratedTeeth;
+    writeStore(this.store, this.save);
   }
 
   onHidden(): void {
@@ -279,13 +277,11 @@ export class Keeper {
     }
     this.notify();
   }
-  private lastSpeed = 1;
 
   hitStop(ms: number): void {
     this.hitStopMs = Math.max(this.hitStopMs, ms);
   }
 
-  /** Advance the world by real milliseconds. */
   update(deltaMs: number): void {
     const dtMs = BALANCE.dt * 1000;
     if (this.hitStopMs > 0) {
@@ -300,20 +296,17 @@ export class Keeper {
         this.sim.tick();
         this.acc -= dtMs;
         steps++;
-        const evs = this.sim.events.splice(0);
-        this.processEvents(evs, false);
+        this.processEvents(this.sim.events.splice(0), false);
         if (this.hitStopMs > 0) break;
       }
       if (steps >= 16) this.acc = 0;
     }
     this.alpha = Math.min(1, this.acc / dtMs);
-
     if (this.attract && this.sim.collapsed) {
       this.sim = this.makeAttract();
       this.frameEvents = [];
       this.notify();
     }
-
     if (this.mode === 'play') {
       this.autosaveMs += deltaMs;
       if (this.autosaveMs > 10_000) {
@@ -321,18 +314,14 @@ export class Keeper {
         this.persist();
       }
       this.audio.setIntensity(this.intensity());
-    } else {
-      this.audio.setIntensity(0);
-    }
+    } else this.audio.setIntensity(0);
   }
 
   private intensity(): number {
     const sim = this.sim;
-    if (!sim.heroes.length) return 0;
-    const g = sim.grid;
-    const mx = g.x(g.maw);
-    const my = g.y(g.maw);
-    const near = sim.heroes.some((h) => Math.abs(h.x - mx) + Math.abs(h.y - my) <= 4);
+    if (!sim.parties.length) return 0;
+    const maw = sim.site(sim.cave.maw);
+    const near = sim.parties.some((p) => Math.hypot(p.x - maw.x, p.y - maw.y) < 14);
     return near || sim.mawHp < sim.mawMaxHp * 0.4 ? 2 : 1;
   }
 
@@ -347,7 +336,7 @@ export class Keeper {
     for (const e of evs) {
       switch (e.t) {
         case 'damage':
-          if (!e.burn) a.play(e.on === 'hero' ? 'heroHurt' : 'monsterHurt', { vol: 0.6, gap: 0.06 });
+          if (!e.dot) a.play(e.on === 'hero' ? 'heroHurt' : 'monsterHurt', { vol: 0.6, gap: 0.06 });
           break;
         case 'heroDied':
           a.play('death', { vol: e.champion ? 1 : 0.7 });
@@ -359,8 +348,14 @@ export class Keeper {
         case 'monsterDied':
           a.play('monsterDeath', { vol: 0.6 });
           break;
+        case 'monsterDown':
+          a.play('monsterDeath', { vol: 0.4, pitch: 1.4 });
+          break;
+        case 'monsterUp':
+          a.play('respawn', { vol: 0.5, pitch: 0.7 });
+          break;
         case 'trap':
-          a.play(e.feature === 'spikes' ? 'spikes' : e.feature === 'oil' ? 'oil' : 'fire', { vol: 0.8 });
+          a.play(e.room === 'spikeHall' ? 'spikes' : e.room === 'oilCellar' ? 'oil' : e.room === 'pitDrop' ? 'fill' : 'fire', { vol: 0.8 });
           break;
         case 'ignite':
           a.play('ignite');
@@ -370,14 +365,14 @@ export class Keeper {
           break;
         case 'disarm':
           a.play('disarm');
-          this.addLog(`A Rogue disarmed your ${FEATURES[this.sim.grid.features[e.tile]?.id ?? 'spikes'].name}.`, 'bad');
+          this.addLog(`A Rogue disarmed your ${ROOMS[this.sim.rooms.get(e.site)?.id ?? 'spikeHall'].name}.`, 'bad');
           break;
         case 'spotted':
-          a.play('spotted', { vol: 0.6 });
+          a.play('spotted', { vol: 0.5 });
           break;
         case 'loot':
           a.play('coin', { pitch: 0.7 });
-          this.addLog(`A hero is looting your Hoard (−${Math.round(e.amount)} Gold).`, 'bad');
+          this.addLog(`A hero is looting your Vault (−${Math.round(e.amount)} Gold).`, 'bad');
           break;
         case 'bite':
           a.play('bite');
@@ -393,7 +388,7 @@ export class Keeper {
         case 'escaped': {
           a.play('escape');
           const loot = e.loot >= 1 ? ` with ${Math.round(e.loot)} Gold` : '';
-          const talk = e.rumors > 0 ? ` and is telling the town about ${e.rumors} trap${e.rumors > 1 ? 's' : ''}` : '';
+          const talk = e.rumors > 0 ? ` and is telling the town about ${e.rumors} room${e.rumors > 1 ? 's' : ''}` : '';
           this.addLog(`A ${HEROES[e.cls].name} escaped${loot}${talk}.`, 'bad');
           break;
         }
@@ -410,13 +405,15 @@ export class Keeper {
         case 'heal':
           a.play('heal', { vol: 0.5, gap: 0.2 });
           break;
-        case 'unlock':
+        case 'unlock': {
           a.play('unlock');
-          this.addLog(`New: ${FEATURES[e.feature].name} unlocked!`, 'good');
-          this.setToast(`Unlocked: ${FEATURES[e.feature].name}`, 'good');
+          const names = ROOM_ORDER.filter((id) => ROOMS[id].tier === e.tier && this.sim.isUnlocked(id)).map((id) => ROOMS[id].name);
+          this.addLog(`New rooms in the catalog: ${names.join(', ')}.`, 'good');
+          this.setToast('New rooms unlocked!', 'good');
           break;
+        }
         case 'respawn':
-          a.play('respawn', { vol: 0.4, gap: 0.3 });
+          a.play('respawn', { vol: 0.35, gap: 0.3 });
           break;
         case 'wipe':
           a.play('wipe');
@@ -425,6 +422,17 @@ export class Keeper {
         case 'ambush':
           a.play('ambush');
           this.addLog('Your Mimic ambushed a hero!', 'good');
+          break;
+        case 'fall':
+          a.play(e.eaten ? 'chomp' : 'heroHurt');
+          if (e.eaten) this.addLog('A hero fell through the Pit Drop straight into your Gullet.', 'good');
+          break;
+        case 'split':
+          if (e.reason === 'loot') this.addLog('A Rogue slipped away from its party to raid your Vault.', 'info');
+          break;
+        case 'excavated':
+          a.play('dig');
+          a.play('fill', { pitch: 0.8 });
           break;
         case 'collapse':
           a.play('collapse');
@@ -447,102 +455,61 @@ export class Keeper {
 
   // ------------------------------------------------------------ player actions
 
-  setTool(tool: Tool): void {
-    if (tool !== 'inspect' && tool !== 'dig' && tool !== 'fill' && tool !== 'demolish' && !this.sim.unlocked.has(tool)) {
-      this.audio.play('nope');
-      this.setToast(`${FEATURES[tool].name} unlocks at ${FEATURES[tool].unlockInfamy} Infamy`, 'bad');
-      return;
+  private result_(r: ActionResult, okSound: string): ActionResult {
+    if (r.ok) this.audio.play(okSound);
+    else {
+      this.audio.play('nope', { gap: 0.15 });
+      if (r.reason) this.setToast(r.reason, 'bad');
     }
-    this.tool = this.tool === tool && tool !== 'inspect' ? 'inspect' : tool;
-    this.audio.play('click');
-    this.notify();
-  }
-
-  /** What the current tool would do on a tile (for hover previews). */
-  check(tile: number): ActionResult {
-    const sim = this.sim;
-    switch (this.tool) {
-      case 'inspect':
-        return { ok: true };
-      case 'dig':
-        return sim.canDig(tile);
-      case 'fill':
-        return sim.canFill(tile);
-      case 'demolish':
-        return sim.canDemolish(tile);
-      default:
-        return sim.canPlace(tile, this.tool);
-    }
-  }
-
-  useTool(tile: number): ActionResult {
-    if (this.mode !== 'play' || this.sim.collapsed) return { ok: false, reason: '' };
-    const sim = this.sim;
-    let r: ActionResult;
-    switch (this.tool) {
-      case 'inspect':
-        return { ok: true };
-      case 'dig':
-        r = sim.dig(tile);
-        if (r.ok) this.audio.play('dig');
-        break;
-      case 'fill':
-        r = sim.fill(tile);
-        if (r.ok) this.audio.play('fill');
-        break;
-      case 'demolish':
-        r = sim.demolish(tile);
-        if (r.ok) {
-          this.audio.play('demolish');
-          if (this.selection?.kind === 'tile' && this.selection.tile === tile) this.selection = null;
-        }
-        break;
-      default:
-        if (sim.grid.features[tile]) {
-          // Clicking something already built with a build tool selects it instead.
-          this.select({ kind: 'tile', tile });
-          return { ok: true };
-        }
-        r = sim.place(tile, this.tool);
-        if (r.ok) this.audio.play('build');
-    }
-    if (!r.ok) this.audio.play('nope', { gap: 0.15 });
     this.notify();
     return r;
   }
 
-  select(sel: Selection): void {
+  select(sel: Selection, at?: { sx: number; sy: number }): void {
     this.selection = sel;
+    this.catalogAt = sel?.kind === 'empty' ? (at ?? { sx: window.innerWidth / 2, sy: window.innerHeight / 2 }) : null;
     if (sel) this.audio.play('click', { vol: 0.6 });
     this.notify();
   }
 
-  upgradeSelected(): ActionResult {
-    const sel = this.selection;
-    let r: ActionResult = { ok: false, reason: 'Select something you built first' };
-    if (sel?.kind === 'tile') r = this.sim.upgrade(sel.tile);
-    else if (sel?.kind === 'maw') r = this.sim.upgradeMaw();
-    this.audio.play(r.ok ? 'upgrade' : 'nope');
-    if (!r.ok && r.reason) this.setToast(r.reason, 'bad');
-    this.notify();
+  buildRoom(site: number, id: RoomId): ActionResult {
+    const r = this.result_(this.sim.build(site, id), 'build');
+    if (r.ok) this.select({ kind: 'room', site });
     return r;
+  }
+
+  sellRoom(site: number): ActionResult {
+    const r = this.result_(this.sim.sell(site), 'demolish');
+    if (r.ok) this.select({ kind: 'empty', site }, this.catalogAt ?? undefined);
+    return r;
+  }
+
+  upgradeTrack(site: number, track: number): ActionResult {
+    return this.result_(this.sim.upgrade(site, track), 'upgrade');
+  }
+
+  digEdge(edge: number): ActionResult {
+    return this.result_(this.sim.dig(edge), 'dig');
+  }
+
+  digBetween(a: number, b: number): ActionResult {
+    const e = this.sim.edgeBetween(a, b);
+    if (!e) return this.result_({ ok: false, reason: 'Those rooms are too far apart to join' }, 'dig');
+    return this.digEdge(e.id);
+  }
+
+  fillEdge(edge: number): ActionResult {
+    const r = this.result_(this.sim.fill(edge), 'fill');
+    if (r.ok) this.selection = null;
+    return r;
+  }
+
+  excavate(region: number): ActionResult {
+    return this.result_(this.sim.excavate(region), 'unlock');
   }
 
   upgradeMaw(): ActionResult {
-    const r = this.sim.upgradeMaw();
-    this.audio.play(r.ok ? 'upgrade' : 'nope');
-    if (!r.ok) this.setToast(r.reason, 'bad');
-    this.notify();
-    return r;
-  }
-
-  demolishSelected(): void {
-    const sel = this.selection;
-    if (sel?.kind !== 'tile') return;
-    const r = this.sim.demolish(sel.tile);
-    this.audio.play(r.ok ? 'demolish' : 'nope');
-    if (r.ok) this.selection = null;
-    this.notify();
+    return this.result_(this.sim.upgradeMaw(), 'upgrade');
   }
 
   setVolume(kind: 'sfx' | 'music', v: number): void {
