@@ -398,6 +398,14 @@ export class Sim {
     return OK;
   }
 
+  /** End this dungeon right now (the player chose to collapse it). */
+  forceCollapse(): void {
+    if (this.collapsed) return;
+    this.mawHp = 0;
+    this.collapsed = true;
+    this.events.push({ t: 'collapse' });
+  }
+
   private occupied(i: number): boolean {
     const g = this.grid;
     return (

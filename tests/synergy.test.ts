@@ -219,3 +219,13 @@ describe('The Maw', () => {
     expect(sim.mawChompDamage).toBeGreaterThan(chomp);
   });
 });
+
+describe('Giving up', () => {
+  it('a forced collapse ends the dungeon immediately', () => {
+    const sim = blankSim();
+    carveMainRoute(sim);
+    sim.forceCollapse();
+    expect(sim.collapsed).toBe(true);
+    expect(sim.events.some((e) => e.t === 'collapse')).toBe(true);
+  });
+});
